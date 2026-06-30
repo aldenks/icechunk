@@ -1677,6 +1677,7 @@ class Repository:
         metadata: dict[str, Any] | None = None,
         rebase_with: ConflictSolver | None = None,
         rebase_tries: int = 1_000,
+        max_concurrent_nodes: int = 1,
     ) -> Iterator[IcechunkStore]:
         """
         Create a transaction on a branch.
@@ -1697,6 +1698,11 @@ class Repository:
             If other session committed while the current session was writing, use Session.rebase with this solver.
         rebase_tries : int, optional
             If other session committed while the current session was writing, use Session.rebase up to this many times in a loop.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently when the
+            transaction commits. With the default of 1 these writes are serialized across
+            arrays; raise it to speed up commits for datasets with many arrays (bounded by
+            the storage's ``max_concurrent_requests``). Default is 1.
 
         Yields
         -------
@@ -1710,6 +1716,7 @@ class Repository:
             metadata=metadata,
             rebase_with=rebase_with,
             rebase_tries=rebase_tries,
+            max_concurrent_nodes=max_concurrent_nodes,
         )
 
     def expire_snapshots(

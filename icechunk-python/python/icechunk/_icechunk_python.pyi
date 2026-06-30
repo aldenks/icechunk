@@ -2751,6 +2751,7 @@ class PySession:
         rebase_with: ConflictSolver | None = None,
         rebase_tries: int = 1_000,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str: ...
     async def commit_async(
         self,
@@ -2759,28 +2760,33 @@ class PySession:
         rebase_with: ConflictSolver | None = None,
         rebase_tries: int = 1_000,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str: ...
     def flush(
         self,
         message: str,
         metadata: dict[str, Any] | None = None,
+        max_concurrent_nodes: int = 1,
     ) -> str: ...
     async def flush_async(
         self,
         message: str,
-        metadata: dict[str, Any] | None,
+        metadata: dict[str, Any] | None = None,
+        max_concurrent_nodes: int = 1,
     ) -> str: ...
     def amend(
         self,
         message: str,
         metadata: dict[str, Any] | None = None,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str: ...
     async def amend_async(
         self,
         message: str,
         metadata: dict[str, Any] | None = None,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str: ...
     def rebase(self, solver: ConflictSolver) -> None: ...
     async def rebase_async(self, solver: ConflictSolver) -> None: ...

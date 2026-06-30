@@ -406,6 +406,7 @@ class Session:
         rebase_with: ConflictSolver | None = None,
         rebase_tries: int = 1_000,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str:
         """
         Commit the changes in the session to the repository.
@@ -426,6 +427,13 @@ class Session:
             If other session committed while the current session was writing, use Session.rebase up to this many times in a loop.
         allow_empty : bool, optional
             If True, allow creating a commit even if there are no changes. Default is False.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently during the commit.
+            A commit writes the manifest(s) for each changed array, so with the default of
+            1 these writes are serialized across arrays and commit latency grows with the
+            number of changed arrays. Raising this parallelizes work across arrays (bounded
+            by the storage's ``max_concurrent_requests``), speeding up commits for datasets
+            with many arrays. Default is 1.
 
         Returns
         -------
@@ -445,6 +453,7 @@ class Session:
             rebase_with=rebase_with,
             rebase_tries=rebase_tries,
             allow_empty=allow_empty,
+            max_concurrent_nodes=max_concurrent_nodes,
         )
 
     async def commit_async(
@@ -455,6 +464,7 @@ class Session:
         rebase_with: ConflictSolver | None = None,
         rebase_tries: int = 1_000,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str:
         """
         Commit the changes in the session to the repository (async version).
@@ -475,6 +485,13 @@ class Session:
             If other session committed while the current session was writing, use Session.rebase up to this many times in a loop.
         allow_empty : bool, optional
             If True, allow creating a commit even if there are no changes. Default is False.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently during the commit.
+            A commit writes the manifest(s) for each changed array, so with the default of
+            1 these writes are serialized across arrays and commit latency grows with the
+            number of changed arrays. Raising this parallelizes work across arrays (bounded
+            by the storage's ``max_concurrent_requests``), speeding up commits for datasets
+            with many arrays. Default is 1.
 
         Returns
         -------
@@ -494,6 +511,7 @@ class Session:
             rebase_with=rebase_with,
             rebase_tries=rebase_tries,
             allow_empty=allow_empty,
+            max_concurrent_nodes=max_concurrent_nodes,
         )
 
     def amend(
@@ -502,6 +520,7 @@ class Session:
         *,
         metadata: dict[str, Any] | None = None,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str:
         """
         Commit the changes in the session to the repository, by amending/overwriting the previous commit.
@@ -523,6 +542,11 @@ class Session:
         allow_empty : bool, optional
             If True, allow amending even if no data changes have been made to the session.
             This is useful when you only want to update the commit message. Default is False.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently. With the default of
+            1 these writes are serialized across arrays; raise it to speed up commits for
+            datasets with many arrays (bounded by the storage's ``max_concurrent_requests``).
+            Default is 1.
 
         Returns
         -------
@@ -534,7 +558,12 @@ class Session:
         icechunk.ConflictError
             If the session is out of date and a conflict occurs.
         """
-        return self._session.amend(message, metadata, allow_empty=allow_empty)
+        return self._session.amend(
+            message,
+            metadata,
+            allow_empty=allow_empty,
+            max_concurrent_nodes=max_concurrent_nodes,
+        )
 
     async def amend_async(
         self,
@@ -542,6 +571,7 @@ class Session:
         *,
         metadata: dict[str, Any] | None = None,
         allow_empty: bool = False,
+        max_concurrent_nodes: int = 1,
     ) -> str:
         """
         Commit the changes in the session to the repository, by amending/overwriting the previous commit.
@@ -563,6 +593,11 @@ class Session:
         allow_empty : bool, optional
             If True, allow amending even if no data changes have been made to the session.
             This is useful when you only want to update the commit message. Default is False.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently. With the default of
+            1 these writes are serialized across arrays; raise it to speed up commits for
+            datasets with many arrays (bounded by the storage's ``max_concurrent_requests``).
+            Default is 1.
 
         Returns
         -------
@@ -574,13 +609,19 @@ class Session:
         icechunk.ConflictError
             If the session is out of date and a conflict occurs.
         """
-        return await self._session.amend_async(message, metadata, allow_empty=allow_empty)
+        return await self._session.amend_async(
+            message,
+            metadata,
+            allow_empty=allow_empty,
+            max_concurrent_nodes=max_concurrent_nodes,
+        )
 
     def flush(
         self,
         message: str,
         *,
         metadata: dict[str, Any] | None = None,
+        max_concurrent_nodes: int = 1,
     ) -> str:
         """
         Save the changes in the session to a new snapshot without modifying the current branch.
@@ -593,19 +634,27 @@ class Session:
             The message to write with the commit.
         metadata : dict[str, Any] | None, optional
             Additional metadata to store with the commit snapshot.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently. With the default of
+            1 these writes are serialized across arrays; raise it to speed up commits for
+            datasets with many arrays (bounded by the storage's ``max_concurrent_requests``).
+            Default is 1.
 
         Returns
         -------
         str
             The ID of the new snapshot.
         """
-        return self._session.flush(message, metadata)
+        return self._session.flush(
+            message, metadata, max_concurrent_nodes=max_concurrent_nodes
+        )
 
     async def flush_async(
         self,
         message: str,
         *,
         metadata: dict[str, Any] | None = None,
+        max_concurrent_nodes: int = 1,
     ) -> str:
         """
         Save the changes in the session to a new snapshot without modifying the current branch.
@@ -618,13 +667,20 @@ class Session:
             The message to write with the commit.
         metadata : dict[str, Any] | None, optional
             Additional metadata to store with the commit snapshot.
+        max_concurrent_nodes : int, optional
+            Number of arrays whose manifests are written concurrently. With the default of
+            1 these writes are serialized across arrays; raise it to speed up commits for
+            datasets with many arrays (bounded by the storage's ``max_concurrent_requests``).
+            Default is 1.
 
         Returns
         -------
         str
             The ID of the new snapshot.
         """
-        return await self._session.flush_async(message, metadata)
+        return await self._session.flush_async(
+            message, metadata, max_concurrent_nodes=max_concurrent_nodes
+        )
 
     def rebase(self, solver: ConflictSolver) -> None:
         """

@@ -150,6 +150,14 @@ session.merge(*remote_sessions)
 print(session.commit("finished writes"))
 ```
 
+!!! tip
+
+    A commit writes a manifest for each changed array, and by default those writes
+    are serialized. For datasets with many arrays this makes commit latency grow with
+    the array count. Pass `session.commit("finished writes", max_concurrent_nodes=N)`
+    to upload the per-array manifests concurrently (bounded by the storage's
+    `max_concurrent_requests`).
+
 Verify that the writes worked as expected:
 
 ```python
