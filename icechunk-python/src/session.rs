@@ -12,6 +12,7 @@ use icechunk::{
     store::{StoreError, StoreErrorKind},
 };
 use pyo3::{
+    exceptions::PyValueError,
     prelude::*,
     types::{PyFunction, PyType},
 };
@@ -30,6 +31,15 @@ use crate::{
 #[pyclass(skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySession(pub Arc<RwLock<Session>>);
+
+// `max_concurrent_nodes` flows into `buffer_unordered(n)`; n=0 never makes
+// progress (parks the task forever), so reject it instead of hanging the commit.
+fn check_max_concurrent_nodes(max_concurrent_nodes: usize) -> PyResult<()> {
+    if max_concurrent_nodes == 0 {
+        return Err(PyValueError::new_err("max_concurrent_nodes must be >= 1"));
+    }
+    Ok(())
+}
 
 #[pyclass(eq, eq_int, rename_all = "snake_case")]
 #[derive(Debug, PartialEq)]
@@ -543,7 +553,7 @@ impl PySession {
         })
     }
 
-    #[pyo3(signature = (message, metadata=None, rebase_with=None, rebase_tries=1_000, allow_empty=false))]
+    #[pyo3(signature = (message, metadata=None, rebase_with=None, rebase_tries=1_000, allow_empty=false, max_concurrent_nodes=1))]
     pub fn commit(
         &self,
         py: Python<'_>,
@@ -552,7 +562,9 @@ impl PySession {
         rebase_with: Option<PyConflictSolver>,
         rebase_tries: Option<u16>,
         allow_empty: bool,
+        max_concurrent_nodes: usize,
     ) -> PyResult<String> {
+        check_max_concurrent_nodes(max_concurrent_nodes)?;
         let metadata = metadata.map(|m| m.into());
         // This is blocking function, we need to release the Gil
         py.detach(move || {
@@ -562,13 +574,17 @@ impl PySession {
                     let mut builder = session
                         .commit(message)
                         .allow_empty(allow_empty)
+                        .max_concurrent_nodes(max_concurrent_nodes)
                         .rebase(solver.as_ref(), rebase_tries.unwrap_or(1_000));
                     if let Some(props) = metadata {
                         builder = builder.properties(props);
                     }
                     builder.execute().await
                 } else {
-                    let mut builder = session.commit(message).allow_empty(allow_empty);
+                    let mut builder = session
+                        .commit(message)
+                        .allow_empty(allow_empty)
+                        .max_concurrent_nodes(max_concurrent_nodes);
                     if let Some(props) = metadata {
                         builder = builder.properties(props);
                     }
@@ -580,7 +596,7 @@ impl PySession {
         })
     }
 
-    #[pyo3(signature = (message, metadata=None, rebase_with=None, rebase_tries=1_000, allow_empty=false))]
+    #[pyo3(signature = (message, metadata=None, rebase_with=None, rebase_tries=1_000, allow_empty=false, max_concurrent_nodes=1))]
     pub fn commit_async<'py>(
         &'py self,
         py: Python<'py>,
@@ -589,7 +605,9 @@ impl PySession {
         rebase_with: Option<PyConflictSolver>,
         rebase_tries: Option<u16>,
         allow_empty: bool,
+        max_concurrent_nodes: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
+        check_max_concurrent_nodes(max_concurrent_nodes)?;
         let session = Arc::clone(&self.0);
         let message = message.to_owned();
 
@@ -600,13 +618,17 @@ impl PySession {
                 let mut builder = session
                     .commit(&message)
                     .allow_empty(allow_empty)
+                    .max_concurrent_nodes(max_concurrent_nodes)
                     .rebase(solver.as_ref(), rebase_tries.unwrap_or(1_000));
                 if let Some(props) = metadata {
                     builder = builder.properties(props);
                 }
                 builder.execute().await
             } else {
-                let mut builder = session.commit(&message).allow_empty(allow_empty);
+                let mut builder = session
+                    .commit(&message)
+                    .allow_empty(allow_empty)
+                    .max_concurrent_nodes(max_concurrent_nodes);
                 if let Some(props) = metadata {
                     builder = builder.properties(props);
                 }
@@ -617,21 +639,26 @@ impl PySession {
         })
     }
 
-    #[pyo3(signature = (message, metadata=None, allow_empty=false))]
+    #[pyo3(signature = (message, metadata=None, allow_empty=false, max_concurrent_nodes=1))]
     pub fn amend(
         &self,
         py: Python<'_>,
         message: &str,
         metadata: Option<PySnapshotProperties>,
         allow_empty: bool,
+        max_concurrent_nodes: usize,
     ) -> PyResult<String> {
+        check_max_concurrent_nodes(max_concurrent_nodes)?;
         let metadata = metadata.map(|m| m.into());
         // This is blocking function, we need to release the Gil
         py.detach(move || {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut session = self.0.write().await;
-                let mut builder =
-                    session.commit(message).amend().allow_empty(allow_empty);
+                let mut builder = session
+                    .commit(message)
+                    .amend()
+                    .allow_empty(allow_empty)
+                    .max_concurrent_nodes(max_concurrent_nodes);
                 if let Some(props) = metadata {
                     builder = builder.properties(props);
                 }
@@ -644,21 +671,27 @@ impl PySession {
         })
     }
 
-    #[pyo3(signature = (message, metadata=None, allow_empty=false))]
+    #[pyo3(signature = (message, metadata=None, allow_empty=false, max_concurrent_nodes=1))]
     pub fn amend_async<'py>(
         &'py self,
         py: Python<'py>,
         message: &str,
         metadata: Option<PySnapshotProperties>,
         allow_empty: bool,
+        max_concurrent_nodes: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
+        check_max_concurrent_nodes(max_concurrent_nodes)?;
         let session = Arc::clone(&self.0);
         let message = message.to_owned();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let metadata = metadata.map(|m| m.into());
             let mut session = session.write().await;
-            let mut builder = session.commit(&message).amend().allow_empty(allow_empty);
+            let mut builder = session
+                .commit(&message)
+                .amend()
+                .allow_empty(allow_empty)
+                .max_concurrent_nodes(max_concurrent_nodes);
             if let Some(props) = metadata {
                 builder = builder.properties(props);
             }
@@ -668,19 +701,24 @@ impl PySession {
         })
     }
 
-    #[pyo3(signature = (message, metadata=None))]
+    #[pyo3(signature = (message, metadata=None, max_concurrent_nodes=1))]
     pub fn flush(
         &self,
         py: Python<'_>,
         message: &str,
         metadata: Option<PySnapshotProperties>,
+        max_concurrent_nodes: usize,
     ) -> PyResult<String> {
+        check_max_concurrent_nodes(max_concurrent_nodes)?;
         let metadata = metadata.map(|m| m.into());
         // This is blocking function, we need to release the Gil
         py.detach(move || {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut session = self.0.write().await;
-                let mut builder = session.commit(message).anonymous();
+                let mut builder = session
+                    .commit(message)
+                    .anonymous()
+                    .max_concurrent_nodes(max_concurrent_nodes);
                 if let Some(props) = metadata {
                     builder = builder.properties(props);
                 }
@@ -693,19 +731,25 @@ impl PySession {
         })
     }
 
+    #[pyo3(signature = (message, metadata=None, max_concurrent_nodes=1))]
     pub fn flush_async<'py>(
         &'py self,
         py: Python<'py>,
         message: &str,
         metadata: Option<PySnapshotProperties>,
+        max_concurrent_nodes: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
+        check_max_concurrent_nodes(max_concurrent_nodes)?;
         let session = Arc::clone(&self.0);
         let message = message.to_owned();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let metadata = metadata.map(|m| m.into());
             let mut session = session.write().await;
-            let mut builder = session.commit(&message).anonymous();
+            let mut builder = session
+                .commit(&message)
+                .anonymous()
+                .max_concurrent_nodes(max_concurrent_nodes);
             if let Some(props) = metadata {
                 builder = builder.properties(props);
             }

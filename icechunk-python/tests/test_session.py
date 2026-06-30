@@ -566,3 +566,37 @@ async def test_repo_status_readonly_blocks_writable_session_async() -> None:
     await repo.create_branch_async("not read-only anymore!", snapshot_id=new_snapshot_id)
     await repo.create_tag_async("an online tag", snapshot_id=new_snapshot_id)
     await repo.garbage_collect_async(datetime.now(UTC))
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+async def test_commit_max_concurrent_nodes(
+    use_async: bool, any_spec_version: int | None
+) -> None:
+    # A commit writes one manifest per array; max_concurrent_nodes parallelizes those
+    # writes. Assert the param is accepted on both code paths and an N-array commit
+    # round-trips, and that the degenerate 0 is rejected (it would otherwise hang
+    # buffer_unordered(0) forever).
+    repo = Repository.create(storage=in_memory_storage(), spec_version=any_spec_version)
+    session = repo.writable_session("main")
+    root = zarr.group(store=session.store, overwrite=True)
+    for i in range(5):
+        root.create_array(f"array_{i}", shape=(4,), chunks=(2,), dtype="int32")[:] = i
+
+    if use_async:
+        snapshot_id = await session.commit_async("many arrays", max_concurrent_nodes=4)
+    else:
+        snapshot_id = session.commit("many arrays", max_concurrent_nodes=4)
+    assert snapshot_id
+
+    store = repo.readonly_session("main").store
+    assert int(zarr.open_array(store, path="array_3")[0]) == 3
+
+    bad = repo.writable_session("main")
+    zarr.group(store=bad.store, overwrite=True).create_array(
+        "x", shape=(1,), chunks=(1,), dtype="int32"
+    )
+    with pytest.raises(ValueError):
+        if use_async:
+            await bad.commit_async("bad", max_concurrent_nodes=0)
+        else:
+            bad.commit("bad", max_concurrent_nodes=0)
