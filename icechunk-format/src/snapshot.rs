@@ -1,6 +1,11 @@
 //! Repository state at a point in time (arrays, groups, and manifest references).
 
-use std::{borrow::Cow, collections::BTreeMap, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -726,6 +731,18 @@ impl Snapshot {
         self.len() == 0
     }
 
+    /// Build a `manifest id -> file info` map in a single O(M) pass.
+    ///
+    /// `manifest_info` scans the manifest file list linearly, so resolving many ids
+    /// against the same snapshot (e.g. flush, which touches every split of every array)
+    /// is O(M) per lookup and O(M^2) overall. Callers doing repeated lookups should build
+    /// this map once and index into it in O(1).
+    pub fn manifest_info_map(
+        &self,
+    ) -> IcechunkResult<HashMap<ManifestId, ManifestFileInfo>> {
+        self.manifest_files().map(|res| res.map(|mf| (mf.id.clone(), mf))).try_collect()
+    }
+
     pub fn manifest_info(
         &self,
         id: &ManifestId,
@@ -995,6 +1012,8 @@ mod tests {
             object_id: ObjectId::random(),
             extents: ManifestExtents::new(&[0, 0, 0], &[100, 100, 100]),
         };
+        let man_ref1_id = man_ref1.object_id.clone();
+        let man_ref2_id = man_ref2.object_id.clone();
 
         let node_ids = iter::repeat_with(NodeId::random).take(7).collect::<Vec<_>>();
         // nodes must be sorted by path
@@ -1150,6 +1169,17 @@ mod tests {
                 },
             }),
         );
+
+        // manifest_info_map must return exactly what the linear manifest_info scan returns.
+        let index = st.manifest_info_map().unwrap();
+        for id in [&man_ref1_id, &man_ref2_id] {
+            assert_eq!(index.get(id), st.manifest_info(id).unwrap().as_ref());
+        }
+        let absent = ObjectId::random();
+        assert_eq!(index.get(&absent), None);
+        assert_eq!(st.manifest_info(&absent).unwrap(), None);
+        assert_eq!(index.len(), 2);
+
         Ok(())
     }
 
