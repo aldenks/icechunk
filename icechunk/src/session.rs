@@ -2603,6 +2603,7 @@ async fn flush_existing_node(
     change_set: &ChangeSet,
     parent_id: &SnapshotId,
     old_snapshot: &Snapshot,
+    manifest_info_index: &HashMap<ManifestId, ManifestFileInfo>,
     split_config: &ManifestSplittingConfig,
     rewrite_manifests: bool,
     node: NodeSnapshot,
@@ -2689,7 +2690,7 @@ async fn flush_existing_node(
                             result.manifest_refs.push(mref.clone());
                             #[expect(clippy::expect_used)]
                             result.manifest_files.push(
-                                old_snapshot.manifest_info(&mref.object_id).inject()?.expect("logic bug. creating manifest file info for an existing manifest failed."),
+                                manifest_info_index.get(&mref.object_id).cloned().expect("logic bug. creating manifest file info for an existing manifest failed."),
                             );
                         } else if let Some((new_ref, file_info)) =
                             write_manifest_with_changes(
@@ -2725,7 +2726,7 @@ async fn flush_existing_node(
                 };
                 for mr in &array_refs {
                     #[expect(clippy::expect_used)]
-                    let mf = old_snapshot.manifest_info(&mr.object_id).inject()?.expect(
+                    let mf = manifest_info_index.get(&mr.object_id).cloned().expect(
                         "Bug in flush function, no manifest file found in snapshot",
                     );
                     result.manifest_files.push(mf);
@@ -2923,10 +2924,15 @@ async fn do_flush(
         .try_collect()
         .inject()?;
 
+    // Build this once (O(M)) so each unchanged split resolves its manifest info in O(1);
+    // otherwise flush degrades to an O(M^2) linear scan per commit. See Snapshot::manifest_info_map.
+    let manifest_info_index = old_snapshot.manifest_info_map().inject()?;
+
     let existing_results: Vec<Option<NodeFlushResult>> =
         stream::iter(array_nodes.into_iter().map(|node| {
             let asset_manager = Arc::clone(&flush_data.asset_manager);
             let old_snapshot = Arc::clone(&old_snapshot);
+            let manifest_info_index = &manifest_info_index;
             async move {
                 flush_existing_node(
                     asset_manager.as_ref(),
@@ -2934,6 +2940,7 @@ async fn do_flush(
                     change_set,
                     parent_id,
                     old_snapshot.as_ref(),
+                    manifest_info_index,
                     split_config,
                     rewrite_manifests,
                     node,
@@ -3904,6 +3911,126 @@ mod tests {
             .execute()
             .await?;
         assert_manifest_count(repo.asset_manager(), initial_manifest_count).await;
+
+        Ok(())
+    }
+
+    // Commits across many arrays each holding many splits, only touching a subset of splits
+    // per commit, to exercise the manifest-info reuse paths in `flush_existing_node`
+    // (the complete-overlap branch and the unchanged-node branch). Both now resolve manifest
+    // infos through the O(1) index built in `do_flush` instead of the old O(M) linear scan.
+    // The read-backs and the final manifest-info resolution assert the swap is behavior-identical.
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_flush_many_arrays_many_splits_resolves_manifest_infos(
+        #[case] spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+
+        let split_sizes = Some(vec![(
+            ManifestSplitCondition::PathMatches { regex: r".*".to_string() },
+            vec![ManifestSplitDim {
+                condition: ManifestSplitDimCondition::Any,
+                num_chunks: 2,
+            }],
+        )]);
+        let man_config = ManifestConfig {
+            splitting: Some(ManifestSplittingConfig { split_sizes }),
+            ..ManifestConfig::default()
+        };
+        let repo = Repository::create(
+            Some(RepositoryConfig {
+                inline_chunk_threshold_bytes: Some(0),
+                manifest: Some(man_config),
+                ..Default::default()
+            }),
+            storage,
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        let num_arrays = 4;
+        let num_chunks: u32 = 8; // 8 chunks / split of 2 => 4 splits per array
+        let shape = ArrayShape::new(vec![(num_chunks as u64, num_chunks)]).unwrap();
+        let dimension_names = Some(vec!["t".into()]);
+        let array_def = Bytes::from_static(br#"{"array":"def"}"#);
+        let array_paths: Vec<Path> =
+            (0..num_arrays).map(|i| format!("/array{i}").try_into().unwrap()).collect();
+
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        for path in &array_paths {
+            session
+                .add_array(
+                    path.clone(),
+                    shape.clone(),
+                    dimension_names.clone(),
+                    array_def.clone(),
+                )
+                .await?;
+        }
+        // First commit: fill every chunk of every array, populating every split's manifest.
+        for path in &array_paths {
+            for idx in 0..num_chunks {
+                let bytes = Bytes::copy_from_slice(&(idx as i32).to_be_bytes());
+                let payload = session.get_chunk_writer()?(bytes).await?;
+                session
+                    .set_chunk_ref(path.clone(), ChunkIndices(vec![idx]), Some(payload))
+                    .await?;
+            }
+        }
+        session.commit("fill").max_concurrent_nodes(8).execute().await?;
+
+        // A handful of commits each touching a single chunk in a single array, so the vast
+        // majority of splits are unchanged and flow through the manifest-info reuse paths.
+        let edits: [(usize, u32); 4] = [(0, 0), (1, 6), (3, 3), (2, 7)];
+        for (array_i, chunk_idx) in edits {
+            let mut session = repo.writable_session("main").await?;
+            let bytes = Bytes::copy_from_slice(&999i32.to_be_bytes());
+            let payload = session.get_chunk_writer()?(bytes).await?;
+            session
+                .set_chunk_ref(
+                    array_paths[array_i].clone(),
+                    ChunkIndices(vec![chunk_idx]),
+                    Some(payload),
+                )
+                .await?;
+            session.commit("edit").max_concurrent_nodes(8).execute().await?;
+
+            // Every chunk of every array must still read back through its (reused) manifest.
+            let ro = repo
+                .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
+                .await?;
+            for path in &array_paths {
+                for idx in 0..num_chunks {
+                    assert!(
+                        ro.get_chunk_ref(path, &ChunkIndices(vec![idx])).await?.is_some(),
+                        "missing chunk {idx} in {path}",
+                    );
+                }
+            }
+        }
+
+        // Every manifest referenced by the final snapshot must resolve to a manifest info,
+        // and the O(1) index must agree with the linear scan for every referenced id.
+        let tip = repo.lookup_branch("main").await?;
+        let snapshot = repo.asset_manager().fetch_snapshot(&tip).await?;
+        let index = snapshot.manifest_info_map()?;
+        let mut checked_refs = 0;
+        for path in &array_paths {
+            if let NodeData::Array { manifests, .. } = &snapshot.get_node(path)?.node_data
+            {
+                for mref in manifests {
+                    let scanned = snapshot.manifest_info(&mref.object_id)?;
+                    assert!(scanned.is_some(), "unresolved manifest {path}");
+                    assert_eq!(index.get(&mref.object_id), scanned.as_ref());
+                    checked_refs += 1;
+                }
+            }
+        }
+        assert!(checked_refs >= num_arrays * 4, "expected many manifest refs");
 
         Ok(())
     }
