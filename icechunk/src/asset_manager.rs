@@ -28,7 +28,6 @@ static RETRYABLE_ERROR: LazyLock<regex::Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-use async_compression::{Level, tokio::bufread::ZstdEncoder};
 use tokio::{
     io::{AsyncBufRead, AsyncReadExt as _},
     sync::Semaphore,
@@ -1371,12 +1370,21 @@ async fn compress_with_header(
     file_type: FileTypeBin,
     compression_level: u8,
 ) -> RepositoryResult<Vec<u8>> {
-    let mut buffer =
-        binary_file_header(spec_version, file_type, CompressionAlgorithmBin::Zstd);
-    let mut encoder =
-        ZstdEncoder::with_quality(data, Level::Precise(compression_level as i32));
-    encoder.read_to_end(&mut buffer).await.capture()?;
-    Ok(buffer)
+    // zstd encoding is CPU-bound; run it on the blocking pool so concurrent writers
+    // (e.g. flush with max_concurrent_nodes > 1) compress on separate threads.
+    let data = data.to_vec();
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || -> RepositoryResult<Vec<u8>> {
+        let _entered = span.entered();
+        let mut buffer =
+            binary_file_header(spec_version, file_type, CompressionAlgorithmBin::Zstd);
+        let mut encoded =
+            zstd::encode_all(data.as_slice(), compression_level as i32).capture()?;
+        buffer.append(&mut encoded);
+        Ok(buffer)
+    })
+    .await
+    .capture()?
 }
 
 async fn write_new_snapshot(

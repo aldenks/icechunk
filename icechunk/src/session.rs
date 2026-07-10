@@ -2519,11 +2519,17 @@ async fn write_manifest_from_stream(
             None
         };
     let mut all: Vec<ChunkInfo> = chunks.try_collect().await?;
-    all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
-    if let Some(new_manifest) =
+    // Sorting and flatbuffer construction are CPU-bound and can dominate flush time
+    // for large manifests; run them on the blocking pool so concurrent nodes
+    // (max_concurrent_nodes) build their manifests on separate threads.
+    let maybe_manifest = tokio::task::spawn_blocking(move || {
+        all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
         Manifest::from_sorted_vec(&ManifestId::random(), all, compression_config.as_ref())
-            .inject()?
-    {
+    })
+    .await
+    .map_err(|e| SessionError::capture(SessionErrorKind::ConcurrencyError(e)))?
+    .inject()?;
+    if let Some(new_manifest) = maybe_manifest {
         let new_manifest = Arc::new(new_manifest);
         let new_manifest_size =
             asset_manager.write_manifest(Arc::clone(&new_manifest)).await.inject()?;
@@ -2559,30 +2565,38 @@ async fn write_manifest_with_changes(
     // Hardcoded to 1: this fetches manifests for a single extent within a single node.
     // Node-level parallelism is already controlled by max_concurrent_nodes in the
     // caller (do_flush), so adding concurrency here would compound it.
-    let mut all_chunks_vec = stream::iter(futs)
-        .buffer_unordered(1)
-        .try_fold(Vec::with_capacity(modified_chunks.len()), |mut acc, manifest| async {
-            acc.extend(manifest.iter(node_id.clone()).inject()?.filter_map_ok(
-                |(idx, payload)| {
-                    if !modified_chunks.contains_key(&idx) && extent.contains(&idx.0) {
-                        Some(ChunkInfo { node: node_id.clone(), coord: idx, payload })
+    let manifests: Vec<Arc<Manifest>> =
+        stream::iter(futs).buffer_unordered(1).try_collect().await?;
+
+    // Iterating and merging existing refs is CPU-bound (decode-iterate the whole
+    // window); run it on the blocking pool so concurrent nodes (max_concurrent_nodes)
+    // merge on separate threads.
+    let node_id_c = node_id.clone();
+    let extent_c = extent.clone();
+    let all_chunks_vec = tokio::task::spawn_blocking(move || {
+        let mut acc = Vec::with_capacity(modified_chunks.len());
+        for manifest in manifests {
+            match manifest.iter(node_id_c.clone()).inject() {
+                Ok(iter) => acc.extend(iter.filter_map_ok(|(idx, payload)| {
+                    if !modified_chunks.contains_key(&idx) && extent_c.contains(&idx.0) {
+                        Some(ChunkInfo { node: node_id_c.clone(), coord: idx, payload })
                     } else {
                         None
                     }
-                },
-            ));
-            Ok(acc)
-        })
-        .await?;
-
-    // Then add modified chunks from ChangeSet
-    all_chunks_vec.extend(modified_chunks.into_iter().filter_map(
-        |(idx, maybe_payload)| {
+                })),
+                Err(e) => return Err(e),
+            }
+        }
+        // Then add modified chunks from ChangeSet
+        acc.extend(modified_chunks.into_iter().filter_map(|(idx, maybe_payload)| {
             maybe_payload.map(|payload| {
-                Ok(ChunkInfo { node: node_id.clone(), coord: idx, payload })
+                Ok(ChunkInfo { node: node_id_c.clone(), coord: idx, payload })
             })
-        },
-    ));
+        }));
+        Ok(acc)
+    })
+    .await
+    .map_err(|e| SessionError::capture(SessionErrorKind::ConcurrencyError(e)))??;
 
     write_manifest_from_stream(
         asset_manager,
