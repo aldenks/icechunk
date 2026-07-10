@@ -2503,6 +2503,20 @@ struct NodeFlushResult {
     manifest_files: Vec<ManifestFileInfo>,
 }
 
+/// Caps concurrent CPU-bound manifest merge/build tasks so the blocking pool can't
+/// oversubscribe the cores. Bounding in-flight tasks also concentrates them on a few
+/// reused pool threads, keeping allocator arena high-water memory bounded. Absent
+/// under shuttle, mirroring `decode_gate` in asset_manager.
+#[cfg(not(feature = "shuttle"))]
+fn flush_cpu_gate() -> &'static tokio::sync::Semaphore {
+    static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+        std::sync::LazyLock::new(|| {
+            let n = std::thread::available_parallelism().map_or(8, |n| n.get());
+            tokio::sync::Semaphore::new(n)
+        });
+    &GATE
+}
+
 async fn write_manifest_from_stream(
     asset_manager: &AssetManager,
     manifest_config: &ManifestConfig,
@@ -2522,7 +2536,12 @@ async fn write_manifest_from_stream(
     // Sorting and flatbuffer construction are CPU-bound and can dominate flush time
     // for large manifests; run them on the blocking pool so concurrent nodes
     // (max_concurrent_nodes) build their manifests on separate threads.
+    #[cfg(not(feature = "shuttle"))]
+    let cpu_permit = flush_cpu_gate().acquire().await;
     let maybe_manifest = tokio::task::spawn_blocking(move || {
+        // release on completion, not on cancelled-future drop
+        #[cfg(not(feature = "shuttle"))]
+        let _cpu_permit = cpu_permit;
         all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
         Manifest::from_sorted_vec(&ManifestId::random(), all, compression_config.as_ref())
     })
@@ -2573,7 +2592,12 @@ async fn write_manifest_with_changes(
     // merge on separate threads.
     let node_id_c = node_id.clone();
     let extent_c = extent.clone();
+    #[cfg(not(feature = "shuttle"))]
+    let cpu_permit = flush_cpu_gate().acquire().await;
     let all_chunks_vec = tokio::task::spawn_blocking(move || {
+        // release on completion, not on cancelled-future drop
+        #[cfg(not(feature = "shuttle"))]
+        let _cpu_permit = cpu_permit;
         let mut acc = Vec::with_capacity(modified_chunks.len());
         for manifest in manifests {
             match manifest.iter(node_id_c.clone()).inject() {

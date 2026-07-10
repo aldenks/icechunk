@@ -1373,9 +1373,15 @@ async fn compress_with_header(
     // zstd encoding is CPU-bound; run it on the blocking pool so concurrent writers
     // (e.g. flush with max_concurrent_nodes > 1) compress on separate threads.
     let data = data.to_vec();
+    // gate concurrent CPU encodes like decodes; absent under shuttle (see decode_gate)
+    #[cfg(not(feature = "shuttle"))]
+    let cpu_permit = decode_gate().acquire().await.capture()?;
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || -> RepositoryResult<Vec<u8>> {
         let _entered = span.entered();
+        // release on encode completion, not on cancelled-future drop
+        #[cfg(not(feature = "shuttle"))]
+        let _cpu_permit = cpu_permit;
         let mut buffer =
             binary_file_header(spec_version, file_type, CompressionAlgorithmBin::Zstd);
         let mut encoded =
