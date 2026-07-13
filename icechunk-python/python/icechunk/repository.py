@@ -1830,6 +1830,7 @@ class Repository:
         branch: str,
         metadata: dict[str, Any] | None = None,
         commit_method: CommitMethod = "new_commit",
+        max_concurrent_manifests: int = 1,
     ) -> str:
         """
         Rewrite manifests for all arrays.
@@ -1854,6 +1855,10 @@ class Repository:
             Use ``"amend"`` to replace the previous commit.
             Note that ``"amend"`` is only supported for spec version 2
             repositories.
+        max_concurrent_manifests : int, optional
+            Number of manifests rewritten concurrently. Defaults to 1 (serial).
+            Raising this parallelizes the rewrite across arrays and manifests,
+            bounded by the storage's concurrency settings.
 
         Returns
         -------
@@ -1862,7 +1867,11 @@ class Repository:
 
         """
         return self._repository.rewrite_manifests(
-            message, branch=branch, metadata=metadata, commit_method=commit_method
+            message,
+            branch=branch,
+            metadata=metadata,
+            commit_method=commit_method,
+            max_concurrent_manifests=max_concurrent_manifests,
         )
 
     async def rewrite_manifests_async(
@@ -1872,6 +1881,7 @@ class Repository:
         branch: str,
         metadata: dict[str, Any] | None = None,
         commit_method: CommitMethod = "new_commit",
+        max_concurrent_manifests: int = 1,
     ) -> str:
         """
         Rewrite manifests for all arrays (async version).
@@ -1896,6 +1906,10 @@ class Repository:
             Use ``"amend"`` to replace the previous commit.
             Note that ``"amend"`` is only supported for spec version 2
             repositories.
+        max_concurrent_manifests : int, optional
+            Number of manifests rewritten concurrently. Defaults to 1 (serial).
+            Raising this parallelizes the rewrite across arrays and manifests,
+            bounded by the storage's concurrency settings.
 
         Returns
         -------
@@ -1904,7 +1918,11 @@ class Repository:
 
         """
         return await self._repository.rewrite_manifests_async(
-            message, branch=branch, metadata=metadata, commit_method=commit_method
+            message,
+            branch=branch,
+            metadata=metadata,
+            commit_method=commit_method,
+            max_concurrent_manifests=max_concurrent_manifests,
         )
 
     def garbage_collect(

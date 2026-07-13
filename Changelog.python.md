@@ -4,6 +4,8 @@
 
 ### Features
 
+- Add a `max_concurrent_manifests` parameter to `Repository.rewrite_manifests`/`rewrite_manifests_async`, exposing the concurrency the Rust implementation already supports. Defaults to `1` (serial), preserving existing behavior ([#XXXX](https://github.com/earth-mover/icechunk/pull/XXXX)).
+
 - Add a `max_concurrent_nodes` parameter to `Session.commit`/`commit_async` (and `amend`/`flush`/`Repository.transaction`) that writes per-array manifests concurrently during a commit, reducing commit latency for datasets with many arrays. Defaults to `1` (serial), preserving existing behavior ([#XXXX](https://github.com/earth-mover/icechunk/pull/XXXX)).
 
 ## Python Icechunk Library 2.1.1

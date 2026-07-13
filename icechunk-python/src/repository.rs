@@ -2701,7 +2701,7 @@ impl PyRepository {
         })
     }
 
-    #[pyo3(signature = (message, *, branch, metadata=None, commit_method="new_commit"))]
+    #[pyo3(signature = (message, *, branch, metadata=None, commit_method="new_commit", max_concurrent_manifests=1))]
     pub(crate) fn rewrite_manifests(
         &self,
         py: Python<'_>,
@@ -2709,7 +2709,11 @@ impl PyRepository {
         branch: &str,
         metadata: Option<PySnapshotProperties>,
         commit_method: &str,
+        max_concurrent_manifests: usize,
     ) -> PyResult<String> {
+        if max_concurrent_manifests == 0 {
+            return Err(PyValueError::new_err("max_concurrent_manifests must be >= 1"));
+        }
         // This function calls block_on, so we need to allow other thread python to make progress
         let commit_method = parse_commit_method(commit_method)?;
         py.detach(move || {
@@ -2717,15 +2721,22 @@ impl PyRepository {
             let result =
                 pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
                     let lock = self.0.read().await;
-                    rewrite_manifests(&lock, branch, message, 1, metadata, commit_method)
-                        .await
-                        .map_err(PyIcechunkStoreError::ManifestOpsError)
+                    rewrite_manifests(
+                        &lock,
+                        branch,
+                        message,
+                        max_concurrent_manifests,
+                        metadata,
+                        commit_method,
+                    )
+                    .await
+                    .map_err(PyIcechunkStoreError::ManifestOpsError)
                 })?;
             Ok(result.to_string())
         })
     }
 
-    #[pyo3(signature = (message, *, branch, metadata=None, commit_method="new_commit"))]
+    #[pyo3(signature = (message, *, branch, metadata=None, commit_method="new_commit", max_concurrent_manifests=1))]
     fn rewrite_manifests_async<'py>(
         &'py self,
         py: Python<'py>,
@@ -2733,7 +2744,11 @@ impl PyRepository {
         branch: &str,
         metadata: Option<PySnapshotProperties>,
         commit_method: &str,
+        max_concurrent_manifests: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if max_concurrent_manifests == 0 {
+            return Err(PyValueError::new_err("max_concurrent_manifests must be >= 1"));
+        }
         let repository = Arc::clone(&self.0);
         let message = message.to_owned();
         let branch = branch.to_owned();
@@ -2746,7 +2761,7 @@ impl PyRepository {
                 &repository,
                 &branch,
                 &message,
-                1,
+                max_concurrent_manifests,
                 metadata,
                 commit_method,
             )

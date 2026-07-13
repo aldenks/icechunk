@@ -2575,6 +2575,7 @@ class PyRepository:
         branch: str,
         metadata: dict[str, Any] | None = None,
         commit_method: CommitMethod = "new_commit",
+        max_concurrent_manifests: int = 1,
     ) -> str: ...
     async def rewrite_manifests_async(
         self,
@@ -2583,6 +2584,7 @@ class PyRepository:
         branch: str,
         metadata: dict[str, Any] | None = None,
         commit_method: CommitMethod = "new_commit",
+        max_concurrent_manifests: int = 1,
     ) -> str: ...
     def garbage_collect(
         self,
