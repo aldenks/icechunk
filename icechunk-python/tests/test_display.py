@@ -468,11 +468,13 @@ class TestReprStructural:
         assert "manifest" in repr_str
         assert "repo_update_retries" in repr_str
         assert "num_updates_per_repo_info_file" in repr_str
+        assert "max_concurrent_manifest_updates" in repr_str
         assert "virtual_chunk_containers" in repr_str
         # str should show scalar defaults and expand nested default configs
         str_str = str(config)
         assert "512 (default)" in str_str  # inline_chunk_threshold_bytes
         assert "256 (default)" in str_str  # max_concurrent_requests
+        assert "1 (default)" in str_str  # max_concurrent_manifest_updates
         # Nested defaults should be expanded
         assert "Zstd (default)" in str_str  # from CompressionConfig
         assert "500000 (default)" in str_str  # from CachingConfig

@@ -38,6 +38,13 @@ The number of concurrent requests to make when getting partial values from stora
 The maximum total number of concurrent requests this repo will allow.
 See [Performance | Concurrency](performance.md#Concurrency) for details.
 
+### [`max_concurrent_manifest_updates`](../reference/config.md#icechunk.config.RepositoryConfig.max_concurrent_manifest_updates)
+
+The number of array nodes whose manifests are updated concurrently during a commit,
+amend, flush, or rewrite_manifests. Each node's update downloads, decompresses,
+merges, recompresses, and uploads its manifest(s), so raising this trades memory for
+lower commit latency on datasets with many arrays. Defaults to `1` (serial).
+
 ### [`compression`](../reference/config.md#icechunk.config.RepositoryConfig.compression)
 
 Icechunk uses Zstd compression to compress its metadata files. [`CompressionConfig`](../reference/config.md#icechunk.config.CompressionConfig) allows you to configure the [compression level](../reference/config.md#icechunk.config.CompressionConfig.level) and [algorithm](../reference/config.md#icechunk.config.CompressionConfig.algorithm). Currently, the only algorithm available is [`Zstd`](https://facebook.github.io/zstd/).

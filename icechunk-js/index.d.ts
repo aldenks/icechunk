@@ -282,6 +282,7 @@ export interface RepositoryConfig {
   getPartialValuesConcurrency?: number
   compression?: CompressionConfig
   maxConcurrentRequests?: number
+  maxConcurrentManifestUpdates?: number
   caching?: CachingConfig
   storage?: StorageSettings
   /**

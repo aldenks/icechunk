@@ -269,7 +269,7 @@ pub struct CommitBuilder<'a> {
     session: &'a mut Session,
     message: String,
     properties: Option<SnapshotProperties>,
-    max_concurrent_nodes: usize,
+    max_concurrent_nodes: Option<usize>,
     allow_empty: bool,
     amend: bool,
     kind: CommitKind,
@@ -294,7 +294,7 @@ impl<'a> CommitBuilder<'a> {
             session,
             message,
             properties: None,
-            max_concurrent_nodes: 1,
+            max_concurrent_nodes: None,
             allow_empty: false,
             amend: false,
             kind: CommitKind::NewCommit,
@@ -311,7 +311,7 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub fn max_concurrent_nodes(mut self, n: usize) -> Self {
-        self.max_concurrent_nodes = n;
+        self.max_concurrent_nodes = Some(n);
         self
     }
 
@@ -398,17 +398,24 @@ impl<'a> CommitBuilder<'a> {
         let commit_method =
             if self.amend { CommitMethod::Amend } else { CommitMethod::NewCommit };
 
+        let max_concurrent_nodes = self
+            .max_concurrent_nodes
+            .unwrap_or_else(|| {
+                self.session.config().max_concurrent_manifest_updates() as usize
+            })
+            .max(1);
+
         match self.kind {
             CommitKind::Flush => {
                 self.session
-                    .do_flush(&self.message, self.max_concurrent_nodes, self.properties)
+                    .do_flush(&self.message, max_concurrent_nodes, self.properties)
                     .await
             }
             CommitKind::RewriteManifests => {
                 self.session
                     .do_rewrite_manifests(
                         &self.message,
-                        self.max_concurrent_nodes,
+                        max_concurrent_nodes,
                         self.properties,
                         commit_method,
                     )
@@ -421,7 +428,7 @@ impl<'a> CommitBuilder<'a> {
                             solver,
                             self.rebase_attempts,
                             &self.message,
-                            self.max_concurrent_nodes,
+                            max_concurrent_nodes,
                             self.properties,
                             self.allow_empty,
                             self.before_rebase,
@@ -432,7 +439,7 @@ impl<'a> CommitBuilder<'a> {
                     self.session
                         .commit_inner(
                             &self.message,
-                            self.max_concurrent_nodes,
+                            max_concurrent_nodes,
                             self.properties,
                             false,
                             commit_method,
@@ -3709,6 +3716,47 @@ mod tests {
         assert!(splits.find(&ChunkIndices(vec![0, 21])).is_none());
         assert!(splits.find(&ChunkIndices(vec![21, 0])).is_none());
 
+        Ok(())
+    }
+
+    // A concurrency of 0 must not silently drop manifests: `buffer_unordered(0)`
+    // yields an empty stream, so without the `.max(1)` guard in `execute()` the
+    // commit would write zero manifests and the chunk would be unreadable.
+    #[tokio::test]
+    async fn test_commit_concurrency_zero_still_flushes() -> Result<(), Box<dyn Error>> {
+        let repo = create_memory_store_repository(SpecVersionBin::V2).await;
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+
+        let array_path: Path = "/array".to_string().try_into().unwrap();
+        let shape = ArrayShape::new(vec![(4, 4)]).unwrap();
+        let array_def = Bytes::from_static(br#"{"this":"array"}"#);
+        session
+            .add_array(array_path.clone(), shape, Some(vec!["t".into()]), array_def)
+            .await?;
+
+        let bytes = Bytes::copy_from_slice(&42i8.to_be_bytes());
+        let payload = session.get_chunk_writer()?(bytes.clone()).await?;
+        session
+            .set_chunk_ref(array_path.clone(), ChunkIndices(vec![0]), Some(payload))
+            .await?;
+
+        // Explicit concurrency of 0, which is coerced to 1.
+        let snapshot =
+            session.commit("zero concurrency").max_concurrent_nodes(0).execute().await?;
+
+        // The manifest must have been written: the chunk is readable from a fresh
+        // read-only session at the new snapshot.
+        let session = repo
+            .readonly_session(&VersionInfo::SnapshotId(snapshot))
+            .await?;
+        let chunk = get_chunk(
+            session
+                .get_chunk_reader(&array_path, &ChunkIndices(vec![0]), &ByteRange::ALL)
+                .await?,
+        )
+        .await?;
+        assert_eq!(chunk, Some(bytes));
         Ok(())
     }
 

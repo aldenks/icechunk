@@ -1701,6 +1701,7 @@ class RepositoryConfig:
         get_partial_values_concurrency: int | None = None,
         compression: CompressionConfig | None = None,
         max_concurrent_requests: int | None = None,
+        max_concurrent_manifest_updates: int | None = None,
         caching: CachingConfig | None = None,
         storage: StorageSettings | None = None,
         virtual_chunk_containers: dict[str, VirtualChunkContainer] | None = None,
@@ -1726,6 +1727,12 @@ class RepositoryConfig:
         max_concurrent_requests: int | None
             The maximum number of concurrent HTTP requests Icechunk will do for this repo.
             Default: 256
+        max_concurrent_manifest_updates: int | None
+            The number of array nodes whose manifests are updated concurrently during a
+            commit, amend, flush, or rewrite_manifests. Each node's update downloads,
+            decompresses, merges, recompresses, and uploads its manifest(s), so higher
+            values trade memory for lower commit latency on datasets with many arrays.
+            Default: 1
         caching: CachingConfig | None
             The caching configuration for the repository. When None, the default
             `CachingConfig` is used.
@@ -1844,6 +1851,33 @@ class RepositoryConfig:
         ----------
         value: int | None
             The maximum allowed.
+        """
+        ...
+    @property
+    def max_concurrent_manifest_updates(self) -> int | None:
+        """
+        The number of array nodes whose manifests are updated concurrently during a
+        commit, amend, flush, or rewrite_manifests. Each node's update downloads,
+        decompresses, merges, recompresses, and uploads its manifest(s), so higher
+        values trade memory for lower commit latency on datasets with many arrays.
+
+        Default: 1
+
+        Returns
+        -------
+        int | None
+            The number of array nodes updated concurrently during a commit.
+        """
+        ...
+    @max_concurrent_manifest_updates.setter
+    def max_concurrent_manifest_updates(self, value: int | None) -> None:
+        """
+        Set the number of array nodes whose manifests are updated concurrently during a commit.
+
+        Parameters
+        ----------
+        value: int | None
+            The maximum number of array nodes to update concurrently.
         """
         ...
     @property

@@ -523,6 +523,11 @@ pub struct RepositoryConfig {
     #[serde(default)]
     pub max_concurrent_requests: Option<u16>,
 
+    /// How many array nodes have their manifests updated concurrently during a
+    /// commit, amend, flush, or rewrite_manifests.
+    #[serde(default)]
+    pub max_concurrent_manifest_updates: Option<u16>,
+
     #[serde(default)]
     pub caching: Option<CachingConfig>,
 
@@ -556,6 +561,7 @@ static DEFAULT_MANIFEST_CONFIG: OnceLock<ManifestConfig> = OnceLock::new();
 static DEFAULT_REPO_UPDATE_RETRY_CONFIG: OnceLock<RepoUpdateRetryConfig> =
     OnceLock::new();
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u16 = 256;
+pub const DEFAULT_MAX_CONCURRENT_MANIFEST_UPDATES: u16 = 1;
 pub const DEFAULT_NUM_UPDATES_PER_REPO_INFO_FILE: u16 = 1_000;
 
 impl RepositoryConfig {
@@ -590,6 +596,11 @@ impl RepositoryConfig {
         self.max_concurrent_requests.unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
     }
 
+    pub fn max_concurrent_manifest_updates(&self) -> u16 {
+        self.max_concurrent_manifest_updates
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_MANIFEST_UPDATES)
+    }
+
     pub fn repo_update_retries(&self) -> &RepoUpdateRetryConfig {
         self.repo_update_retries.as_ref().unwrap_or_else(|| {
             DEFAULT_REPO_UPDATE_RETRY_CONFIG.get_or_init(RepoUpdateRetryConfig::default)
@@ -618,6 +629,15 @@ impl RepositoryConfig {
             max_concurrent_requests: match (
                 &self.max_concurrent_requests,
                 other.max_concurrent_requests,
+            ) {
+                (None, None) => None,
+                (None, Some(c)) => Some(c),
+                (Some(c), None) => Some(*c),
+                (Some(_), Some(theirs)) => Some(theirs),
+            },
+            max_concurrent_manifest_updates: match (
+                &self.max_concurrent_manifest_updates,
+                other.max_concurrent_manifest_updates,
             ) {
                 (None, None) => None,
                 (None, Some(c)) => Some(c),
@@ -771,6 +791,46 @@ mod tests {
 
     #[cfg(feature = "object-store-azure")]
     use crate::strategies::azure_static_credentials;
+
+    #[icechunk_macros::test]
+    fn test_max_concurrent_manifest_updates_default_and_merge() {
+        use crate::config::DEFAULT_MAX_CONCURRENT_MANIFEST_UPDATES;
+
+        // Unset resolves to the serial default.
+        let unset = RepositoryConfig::default();
+        assert_eq!(unset.max_concurrent_manifest_updates, None);
+        assert_eq!(
+            unset.max_concurrent_manifest_updates(),
+            DEFAULT_MAX_CONCURRENT_MANIFEST_UPDATES
+        );
+        assert_eq!(DEFAULT_MAX_CONCURRENT_MANIFEST_UPDATES, 1);
+
+        // An explicit value is returned by the accessor.
+        let set = RepositoryConfig {
+            max_concurrent_manifest_updates: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(set.max_concurrent_manifest_updates(), 16);
+
+        // merge: the other config's value wins when set, otherwise ours is kept.
+        assert_eq!(
+            unset.merge(set.clone()).max_concurrent_manifest_updates,
+            Some(16)
+        );
+        assert_eq!(
+            set.merge(RepositoryConfig::default()).max_concurrent_manifest_updates,
+            Some(16)
+        );
+        // When both are set, the other config's value wins.
+        let other = RepositoryConfig {
+            max_concurrent_manifest_updates: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(
+            set.merge(other).max_concurrent_manifest_updates,
+            Some(4)
+        );
+    }
 
     #[icechunk_macros::test]
     fn test_merge_replaces_virtual_chunk_containers() {
