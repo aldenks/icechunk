@@ -2,6 +2,10 @@
 
 ## Python Icechunk Library [unreleased]
 
+### Performance
+
+- Speed up commits and session opening in repositories with many manifests by using binary search instead of linear scans to look up manifest metadata.
+
 ## Python Icechunk Library 2.2.0
 
 ### Features

@@ -731,6 +731,7 @@ impl Snapshot {
         id: &ManifestId,
     ) -> IcechunkResult<Option<ManifestFileInfo>> {
         let root = self.root();
+        // Both manifest vectors are sorted by id in from_iter, as required by snapshot.fbs.
         if let Some(mf2) = root.manifest_files_v2() {
             lookup_index_by_key(mf2, Some(id.0), |mf, id| {
                 mf.id().map(|mid| mid.0).cmp(id)
