@@ -732,16 +732,15 @@ impl Snapshot {
     ) -> IcechunkResult<Option<ManifestFileInfo>> {
         let root = self.root();
         if let Some(mf2) = root.manifest_files_v2() {
-            mf2.iter()
-                .find(|mf| mf.id().is_some_and(|mid| mid.0 == id.0))
-                .map(|mf| (&mf).try_into())
-                .transpose()
+            lookup_index_by_key(mf2, Some(id.0), |mf, id| {
+                mf.id().map(|mid| mid.0).cmp(id)
+            })
+            .map(|index| (&mf2.get(index)).try_into())
+            .transpose()
         } else {
-            Ok(root
-                .manifest_files()
-                .iter()
-                .find(|mi| mi.id().0 == id.0)
-                .map(|man| man.into()))
+            let mf1 = root.manifest_files();
+            Ok(lookup_index_by_key(mf1, id.0, |mf, id| mf.id().0.cmp(id))
+                .map(|index| mf1.get(index).into()))
         }
     }
 }
@@ -971,6 +970,49 @@ mod tests {
         serialize_and_deserialize_node_snapshot - node_snapshot,
         serialize_and_deserialize_manifest_file_info - manifest_file_info
     );
+
+    #[icechunk_macros::test]
+    fn test_manifest_info() -> IcechunkResult<()> {
+        let manifest_id = |value: u32| {
+            let mut bytes = [0; 12];
+            bytes[8..].copy_from_slice(&value.to_be_bytes());
+            ManifestId::new(bytes)
+        };
+
+        for spec_version in [SpecVersionBin::V1, SpecVersionBin::V2] {
+            for count in [0, 1, 4096] {
+                // Reverse the input to exercise snapshot construction's ID sorting.
+                let manifests: Vec<_> = (1..=count)
+                    .rev()
+                    .map(|i| ManifestFileInfo {
+                        id: manifest_id(2 * i),
+                        size_bytes: u64::from(i) * 100,
+                        num_chunk_refs: i,
+                    })
+                    .collect();
+                let snapshot = Snapshot::from_iter(
+                    None,
+                    None,
+                    spec_version,
+                    "",
+                    None,
+                    manifests.clone(),
+                    None,
+                    iter::empty(),
+                )?;
+
+                for manifest in manifests {
+                    assert_eq!(snapshot.manifest_info(&manifest.id)?, Some(manifest));
+                }
+                // Misses before, between, and after the stored IDs.
+                assert_eq!(snapshot.manifest_info(&manifest_id(0))?, None);
+                for i in 0..=count {
+                    assert_eq!(snapshot.manifest_info(&manifest_id(2 * i + 1))?, None);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[icechunk_macros::test]
     fn test_get_node() -> Result<(), Box<dyn std::error::Error>> {
