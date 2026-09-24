@@ -135,6 +135,7 @@ pub(crate) mod codes {
         NOT_A_GROUP => "not-a-group",
         INVALID_BYTE_RANGE => "invalid-byte-range",
         INVALID_COMMIT_CONFIGURATION => "invalid-commit-configuration",
+        INVALID_REPOSITORY_CONFIGURATION => "invalid-repository-configuration",
         INVALID_ARRAY_METADATA => "invalid-array-metadata",
         INVALID_FEATURE_FLAG => "invalid-feature-flag",
         INVALID_VIRTUAL_REF => "invalid-virtual-ref",
@@ -354,6 +355,9 @@ fn classify_repository(kind: &RepositoryErrorKind) -> Classified {
         }
         K::ConfigDeserializationError(_) => {
             class("FormatError", codes::CONFIG_DESERIALIZATION)
+        }
+        K::InvalidConfig(_) => {
+            class("InvalidInputError", codes::INVALID_REPOSITORY_CONFIGURATION)
         }
         K::ConfigWasUpdated => Classified::Conflict {
             expected_parent: None,

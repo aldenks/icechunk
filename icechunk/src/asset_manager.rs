@@ -108,6 +108,9 @@ pub struct AssetManager {
     decode_semaphore: Arc<Semaphore>,
 
     #[serde(skip)]
+    manifest_cpu_semaphore: Arc<Semaphore>,
+
+    #[serde(skip)]
     repo_cache: RwLock<Option<(Arc<RepoInfo>, VersionInfo)>>,
 }
 
@@ -193,6 +196,9 @@ impl AssetManager {
             manifest_cache_size_warned: AtomicBool::new(false),
             request_semaphore: Semaphore::new(max_concurrent_requests as usize),
             decode_semaphore: Arc::new(Semaphore::new(max_concurrent_decodes as usize)),
+            manifest_cpu_semaphore: Arc::new(Semaphore::new(
+                crate::config::default_max_concurrent_decodes() as usize,
+            )),
             repo_cache: RwLock::new(None),
             use_repo_info_cache,
         }
@@ -355,13 +361,46 @@ impl AssetManager {
         }
     }
 
+    /// Admit CPU work before submitting it to the blocking pool. The permit stays
+    /// with the work even if its caller is cancelled. This gate is independent of
+    /// decoding: work must not fetch assets or wait on another blocking task.
+    pub(crate) async fn run_manifest_cpu<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> RepositoryResult<T> {
+        #[cfg(not(feature = "shuttle"))]
+        let permit =
+            Arc::clone(&self.manifest_cpu_semaphore).acquire_owned().await.capture()?;
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(not(feature = "shuttle"))]
+            let _permit = permit;
+            let _entered = span.entered();
+            work()
+        })
+        .await
+        .capture()
+    }
+
     #[instrument(skip(self, manifest))]
     pub async fn write_manifest(&self, manifest: Arc<Manifest>) -> RepositoryResult<u64> {
         let manifest_c = Arc::clone(&manifest);
+        let spec_version = self.spec_version();
+        let compression_level = self.compression_level;
+        let buffer = self
+            .run_manifest_cpu(move || {
+                compress_with_header(
+                    manifest_c.bytes(),
+                    spec_version,
+                    FileTypeBin::Manifest,
+                    compression_level,
+                )
+            })
+            .await??;
         let res = write_new_manifest(
-            manifest_c,
-            self.spec_version(),
-            self.compression_level,
+            &manifest,
+            buffer,
+            spec_version,
             self.storage.as_ref(),
             &self.storage_settings,
             &self.request_semaphore,
@@ -1240,9 +1279,9 @@ fn check_file_type(header: &FileHeader, file_type: FileTypeBin) -> RepositoryRes
 }
 
 async fn write_new_manifest(
-    new_manifest: Arc<Manifest>,
+    new_manifest: &Manifest,
+    buffer: Vec<u8>,
     spec_version: SpecVersionBin,
-    compression_level: u8,
     storage: &(dyn Storage + Send + Sync),
     storage_settings: &storage::Settings,
     semaphore: &Semaphore,
@@ -1271,15 +1310,6 @@ async fn write_new_manifest(
     ];
 
     let id = new_manifest.id().clone();
-
-    // TODO: we should compress only when the manifest reaches a certain size
-    // but then, we would need to include metadata to know if it's compressed or not
-    let buffer = compress_with_header(
-        new_manifest.bytes(),
-        spec_version,
-        FileTypeBin::Manifest,
-        compression_level,
-    )?;
 
     let len = buffer.len() as u64;
     debug!(%id, size_bytes=len, "Writing manifest");
@@ -1967,6 +1997,80 @@ mod test {
         storage::{Storage, logging::LoggingStorage, new_in_memory_storage},
     };
     use std::collections::HashMap;
+
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn manifest_cpu_admission_survives_cancellation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()?
+            .block_on(async {
+                let storage = new_in_memory_storage().await?;
+                let mut manager = AssetManager::new_no_cache(
+                    storage,
+                    storage::Settings::default(),
+                    SpecVersionBin::V2,
+                    1,
+                    100,
+                );
+                manager.manifest_cpu_semaphore = Arc::new(Semaphore::new(2));
+                let manager = Arc::new(manager);
+                let mut jobs = Vec::new();
+                let mut releases = Vec::new();
+                for _ in 0..2 {
+                    let manager = Arc::clone(&manager);
+                    let (started, started_rx) = tokio::sync::oneshot::channel();
+                    let (release, release_rx) = std::sync::mpsc::channel();
+                    jobs.push(tokio::spawn(async move {
+                        manager
+                            .run_manifest_cpu(move || {
+                                started.send(()).unwrap();
+                                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                            })
+                            .await
+                    }));
+                    releases.push(release);
+                    // On this current-thread runtime, receiving both notifications also
+                    // proves that neither CPU job blocks the async task or the other job.
+                    started_rx.await?;
+                }
+                assert_eq!(manager.manifest_cpu_semaphore.available_permits(), 0);
+
+                let next = manager.run_manifest_cpu(|| 42);
+                tokio::pin!(next);
+                assert!(futures::poll!(&mut next).is_pending());
+
+                let cancelled = jobs.remove(0);
+                cancelled.abort();
+                assert!(cancelled.await.unwrap_err().is_cancelled());
+                // Dropping the async caller must not admit another job while its CPU
+                // closure is still running and retaining the manifest working set.
+                assert_eq!(manager.manifest_cpu_semaphore.available_permits(), 0);
+                assert!(futures::poll!(&mut next).is_pending());
+                releases.remove(0).send(())?;
+                assert_eq!(next.await?, 42);
+                releases.remove(0).send(())?;
+                jobs.remove(0).await??;
+                assert_eq!(manager.manifest_cpu_semaphore.available_permits(), 2);
+
+                let failed = manager
+                    .run_manifest_cpu(|| Err::<(), _>("injected CPU failure"))
+                    .await?;
+                assert_eq!(failed, Err("injected CPU failure"));
+                let panicked = manager
+                    .run_manifest_cpu(|| panic!("injected CPU panic"))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    panicked.kind,
+                    RepositoryErrorKind::ConcurrencyError(_)
+                ));
+                assert_eq!(manager.manifest_cpu_semaphore.available_permits(), 2);
+                Ok(())
+            })
+    }
 
     /// A buffer no serializer of ours would ever produce.
     fn unreadable_buffer(size: usize) -> Vec<u8> {

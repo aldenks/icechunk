@@ -97,6 +97,7 @@ class ErrorKind(StrEnum):
     NOT_A_GROUP = "not-a-group"
     INVALID_BYTE_RANGE = "invalid-byte-range"
     INVALID_COMMIT_CONFIGURATION = "invalid-commit-configuration"
+    INVALID_REPOSITORY_CONFIGURATION = "invalid-repository-configuration"
     INVALID_ARRAY_METADATA = "invalid-array-metadata"
     INVALID_FEATURE_FLAG = "invalid-feature-flag"
     INVALID_VIRTUAL_REF = "invalid-virtual-ref"

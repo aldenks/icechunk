@@ -393,7 +393,7 @@ pub enum IcechunkFormatErrorKind {
     SerializationError(#[from] Box<rmp_serde::encode::Error>),
     #[error("error during metadata serialization")]
     SerializationErrorFlexBuffers(#[from] Box<flexbuffers::SerializationError>),
-    #[error("error during metadata deserialization")]
+    #[error("error during metadata deserialization: {0}")]
     DeserializationErrorFlexBuffers(#[from] Box<flexbuffers::DeserializationError>),
     #[error("I/O error")]
     IO(#[from] std::io::Error),

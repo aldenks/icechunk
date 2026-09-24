@@ -393,9 +393,23 @@ prop_compose! {
     pub fn manifest_config()
         (splitting in option::of(manifest_splitting_config()),
         preload in option::of(manifest_preload_config()),
-        max_concurrent_manifest_fetches_during_commit in option::of(any::<u16>()))
+        manifest_commit_concurrency in prop_oneof![
+            Just((None, None)),
+            any::<u16>().prop_map(|value| (Some(value), None)),
+            any::<u16>().prop_map(|value| (None, Some(value))),
+        ])
     -> ManifestConfig {
-        ManifestConfig{preload, splitting, virtual_chunk_location_compression: None, max_concurrent_manifest_fetches_during_commit}
+        let (
+            max_concurrent_manifest_fetches_during_commit,
+            max_concurrent_manifest_updates_during_commit,
+        ) = manifest_commit_concurrency;
+        ManifestConfig {
+            preload,
+            splitting,
+            virtual_chunk_location_compression: None,
+            max_concurrent_manifest_fetches_during_commit,
+            max_concurrent_manifest_updates_during_commit,
+        }
     }
 }
 

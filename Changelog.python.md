@@ -2,6 +2,11 @@
 
 ## Python Icechunk Library [unreleased]
 
+### Features
+
+- Add `ManifestConfig.max_concurrent_manifest_updates_during_commit` as the accurately named setting for manifest update concurrency. The legacy `max_concurrent_manifest_fetches_during_commit` name remains supported, but the two names are mutually exclusive. Defaults to `1`, and `0` is clamped to `1`. In the Rust API, both effective-value accessors and `ManifestConfig::merge` / `RepositoryConfig::merge` are now fallible; callers must handle or propagate `ConfigError`, and exhaustive `ManifestConfig` struct literals must include the new field. Repositories with the legacy name stored must continue using that name; overrides cannot clear it.
+- Manifest merge, construction, and compression now run on the blocking pool behind a per-asset-manager CPU admission gate. Splits within an array remain serial. Sessions pickled by this version should not be unpickled by older versions.
+
 ### Fixes
 
 - `storage_class`, `metadata_storage_class` and `chunks_storage_class` now apply to the `object_store` backends — `gcs_storage`, `azure_storage` and `s3_object_store_storage`. The value is passed to the provider unchanged, so use its own names ([#904](https://github.com/earth-mover/icechunk/issues/904), [#2364](https://github.com/earth-mover/icechunk/issues/2364)).

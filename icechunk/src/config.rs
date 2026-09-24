@@ -13,7 +13,8 @@ use std::{
 
 use itertools::Either;
 use regex::bytes::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use thiserror::Error;
 
 use crate::{
     format::Path,
@@ -398,7 +399,16 @@ impl From<&ManifestVirtualChunkLocationCompressionConfig>
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    #[error(
+        "max_concurrent_manifest_updates_during_commit and max_concurrent_manifest_fetches_during_commit are mutually exclusive"
+    )]
+    ConflictingManifestCommitConcurrency,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Clone, Default)]
 pub struct ManifestConfig {
     #[serde(default)]
     pub preload: Option<ManifestPreloadConfig>,
@@ -409,6 +419,44 @@ pub struct ManifestConfig {
         Option<ManifestVirtualChunkLocationCompressionConfig>,
     #[serde(default)]
     pub max_concurrent_manifest_fetches_during_commit: Option<u16>,
+    #[serde(default)]
+    pub max_concurrent_manifest_updates_during_commit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct SerializedManifestConfig {
+    #[serde(default)]
+    preload: Option<ManifestPreloadConfig>,
+    #[serde(default)]
+    splitting: Option<ManifestSplittingConfig>,
+    #[serde(default)]
+    virtual_chunk_location_compression:
+        Option<ManifestVirtualChunkLocationCompressionConfig>,
+    #[serde(default)]
+    max_concurrent_manifest_fetches_during_commit: Option<u16>,
+    #[serde(default)]
+    max_concurrent_manifest_updates_during_commit: Option<u16>,
+}
+
+impl<'de> Deserialize<'de> for ManifestConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let serialized = SerializedManifestConfig::deserialize(deserializer)?;
+        let config = Self {
+            preload: serialized.preload,
+            splitting: serialized.splitting,
+            virtual_chunk_location_compression: serialized
+                .virtual_chunk_location_compression,
+            max_concurrent_manifest_fetches_during_commit: serialized
+                .max_concurrent_manifest_fetches_during_commit,
+            max_concurrent_manifest_updates_during_commit: serialized
+                .max_concurrent_manifest_updates_during_commit,
+        };
+        config.validate().map_err(de::Error::custom)?;
+        Ok(config)
+    }
 }
 
 static DEFAULT_MANIFEST_PRELOAD_CONFIG: OnceLock<ManifestPreloadConfig> = OnceLock::new();
@@ -419,8 +467,25 @@ static DEFAULT_MANIFEST_VIRTUAL_CHUNK_LOCATION_COMPRESSION_CONFIG: OnceLock<
 > = OnceLock::new();
 
 impl ManifestConfig {
-    pub fn merge(&self, other: Self) -> Self {
-        Self {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_concurrent_manifest_fetches_during_commit.is_some()
+            && self.max_concurrent_manifest_updates_during_commit.is_some()
+        {
+            Err(ConfigError::ConflictingManifestCommitConcurrency)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Merge `other` over this configuration.
+    ///
+    /// This method returns a `Result` so callers cannot silently combine the legacy
+    /// and new manifest commit concurrency fields. Rust callers migrating from the
+    /// previous infallible API must handle or propagate [`ConfigError`].
+    pub fn merge(&self, other: Self) -> Result<Self, ConfigError> {
+        self.validate()?;
+        other.validate()?;
+        let merged = Self {
             preload: other.preload.or(self.preload.clone()),
             splitting: other.splitting.or(self.splitting.clone()),
             virtual_chunk_location_compression: match (
@@ -435,7 +500,12 @@ impl ManifestConfig {
             max_concurrent_manifest_fetches_during_commit: other
                 .max_concurrent_manifest_fetches_during_commit
                 .or(self.max_concurrent_manifest_fetches_during_commit),
-        }
+            max_concurrent_manifest_updates_during_commit: other
+                .max_concurrent_manifest_updates_during_commit
+                .or(self.max_concurrent_manifest_updates_during_commit),
+        };
+        merged.validate()?;
+        Ok(merged)
     }
 
     pub fn preload(&self) -> &ManifestPreloadConfig {
@@ -460,9 +530,27 @@ impl ManifestConfig {
         })
     }
 
+    /// The effective manifest update concurrency under the legacy field name.
+    ///
+    /// This method remains available for legacy-name compatibility, but now returns a
+    /// `Result`. Rust callers migrating from the previous infallible API must handle or
+    /// propagate [`ConfigError`].
+    pub fn max_concurrent_manifest_fetches_during_commit(
+        &self,
+    ) -> Result<u16, ConfigError> {
+        self.max_concurrent_manifest_updates_during_commit()
+    }
+
     /// The effective manifest update concurrency, always at least 1.
-    pub fn max_concurrent_manifest_fetches_during_commit(&self) -> u16 {
-        self.max_concurrent_manifest_fetches_during_commit.unwrap_or(1).max(1)
+    pub fn max_concurrent_manifest_updates_during_commit(
+        &self,
+    ) -> Result<u16, ConfigError> {
+        self.validate()?;
+        Ok(self
+            .max_concurrent_manifest_updates_during_commit
+            .or(self.max_concurrent_manifest_fetches_during_commit)
+            .unwrap_or(1)
+            .max(1))
     }
 
     // for testing only, create a config with no preloading, no splitting, and no max_arrays to scan
@@ -476,6 +564,7 @@ impl ManifestConfig {
             splitting: None,
             virtual_chunk_location_compression: None,
             max_concurrent_manifest_fetches_during_commit: None,
+            max_concurrent_manifest_updates_during_commit: None,
         }
     }
 }
@@ -623,8 +712,22 @@ impl RepositoryConfig {
             .unwrap_or(DEFAULT_NUM_UPDATES_PER_REPO_INFO_FILE)
     }
 
-    pub fn merge(&self, other: Self) -> Self {
-        Self {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(manifest) = &self.manifest {
+            manifest.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Merge `other` over this repository configuration.
+    ///
+    /// This method returns a `Result` so callers cannot silently combine the legacy
+    /// and new manifest commit concurrency fields. Rust callers migrating from the
+    /// previous infallible API must handle or propagate [`ConfigError`].
+    pub fn merge(&self, other: Self) -> Result<Self, ConfigError> {
+        self.validate()?;
+        other.validate()?;
+        let merged = Self {
             inline_chunk_threshold_bytes: other
                 .inline_chunk_threshold_bytes
                 .or(self.inline_chunk_threshold_bytes),
@@ -682,7 +785,7 @@ impl RepositoryConfig {
                 (None, None) => None,
                 (None, Some(c)) => Some(c),
                 (Some(c), None) => Some(c.clone()),
-                (Some(mine), Some(theirs)) => Some(mine.merge(theirs)),
+                (Some(mine), Some(theirs)) => Some(mine.merge(theirs)?),
             },
             previous_file: match (&self.previous_file, other.previous_file) {
                 (None, None) => None,
@@ -708,7 +811,9 @@ impl RepositoryConfig {
                 (Some(c), None) => Some(*c),
                 (Some(_), Some(theirs)) => Some(theirs),
             },
-        }
+        };
+        merged.validate()?;
+        Ok(merged)
     }
 }
 
@@ -804,40 +909,115 @@ mod tests {
     use crate::strategies::azure_static_credentials;
 
     #[icechunk_macros::test]
-    fn test_max_concurrent_manifest_fetches_during_commit_default_and_merge() {
-        use crate::config::ManifestConfig;
+    fn test_manifest_commit_concurrency_default_clamp_and_merge() {
+        use crate::config::{ConfigError, ManifestConfig};
 
         // Unset resolves to the serial default.
         let unset = ManifestConfig::default();
         assert_eq!(unset.max_concurrent_manifest_fetches_during_commit, None);
-        assert_eq!(unset.max_concurrent_manifest_fetches_during_commit(), 1);
+        assert_eq!(unset.max_concurrent_manifest_fetches_during_commit(), Ok(1));
+        assert_eq!(unset.max_concurrent_manifest_updates_during_commit(), Ok(1));
 
-        // An explicit value is returned by the accessor.
-        let set = ManifestConfig {
+        // Either field alone is valid and zero is clamped to one.
+        let legacy = ManifestConfig {
             max_concurrent_manifest_fetches_during_commit: Some(16),
             ..Default::default()
         };
-        assert_eq!(set.max_concurrent_manifest_fetches_during_commit(), 16);
+        assert_eq!(legacy.max_concurrent_manifest_fetches_during_commit(), Ok(16));
+        assert_eq!(legacy.max_concurrent_manifest_updates_during_commit(), Ok(16));
+        let updates = ManifestConfig {
+            max_concurrent_manifest_updates_during_commit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(updates.max_concurrent_manifest_fetches_during_commit(), Ok(1));
+        assert_eq!(updates.max_concurrent_manifest_updates_during_commit(), Ok(1));
 
         // merge: the other config's value wins when set, otherwise ours is kept.
         assert_eq!(
-            unset.merge(set.clone()).max_concurrent_manifest_fetches_during_commit,
-            Some(16)
-        );
-        assert_eq!(
-            set.merge(ManifestConfig::default())
+            unset
+                .merge(legacy.clone())
+                .unwrap()
                 .max_concurrent_manifest_fetches_during_commit,
             Some(16)
         );
-        // When both are set, the other config's value wins.
-        let other = ManifestConfig {
+        assert_eq!(
+            legacy
+                .merge(ManifestConfig::default())
+                .unwrap()
+                .max_concurrent_manifest_fetches_during_commit,
+            Some(16)
+        );
+        let other_legacy = ManifestConfig {
             max_concurrent_manifest_fetches_during_commit: Some(4),
             ..Default::default()
         };
         assert_eq!(
-            set.merge(other).max_concurrent_manifest_fetches_during_commit,
+            legacy
+                .merge(other_legacy)
+                .unwrap()
+                .max_concurrent_manifest_fetches_during_commit,
             Some(4)
         );
+
+        // Fieldwise merging may not turn individually valid aliases into an invalid config.
+        assert_eq!(
+            legacy.merge(updates.clone()),
+            Err(ConfigError::ConflictingManifestCommitConcurrency)
+        );
+        assert_eq!(
+            updates.merge(legacy),
+            Err(ConfigError::ConflictingManifestCommitConcurrency)
+        );
+    }
+
+    #[icechunk_macros::test]
+    fn test_manifest_commit_concurrency_deserialization_validation() {
+        use crate::config::{
+            ManifestConfig, ManifestPreloadConfig, ManifestSplittingConfig,
+            ManifestVirtualChunkLocationCompressionConfig,
+        };
+
+        let legacy_yaml = "max_concurrent_manifest_fetches_during_commit: 3\n";
+        let legacy: ManifestConfig = serde_yaml_ng::from_str(legacy_yaml).unwrap();
+        assert_eq!(legacy.max_concurrent_manifest_updates_during_commit(), Ok(3));
+
+        let updates_json = r#"{"max_concurrent_manifest_updates_during_commit":0}"#;
+        let updates: ManifestConfig = serde_json::from_str(updates_json).unwrap();
+        assert_eq!(updates.max_concurrent_manifest_updates_during_commit(), Ok(1));
+        let null_manifest: RepositoryConfig =
+            serde_json::from_str(r#"{"manifest":null}"#).unwrap();
+        assert_eq!(null_manifest.manifest, None);
+
+        // MessagePack uses positional structs. Preserve the four-field layout
+        // written before the update-concurrency field was added.
+        #[derive(serde::Serialize)]
+        struct LegacyManifestConfig {
+            preload: Option<ManifestPreloadConfig>,
+            splitting: Option<ManifestSplittingConfig>,
+            virtual_chunk_location_compression:
+                Option<ManifestVirtualChunkLocationCompressionConfig>,
+            max_concurrent_manifest_fetches_during_commit: Option<u16>,
+        }
+        let bytes = rmp_serde::to_vec(&LegacyManifestConfig {
+            preload: None,
+            splitting: None,
+            virtual_chunk_location_compression: None,
+            max_concurrent_manifest_fetches_during_commit: Some(3),
+        })
+        .unwrap();
+        let decoded: ManifestConfig = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, legacy);
+
+        let conflicting_yaml = r#"
+max_concurrent_manifest_fetches_during_commit: 2
+max_concurrent_manifest_updates_during_commit: 4
+"#;
+        let error =
+            serde_yaml_ng::from_str::<ManifestConfig>(conflicting_yaml).unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
+
+        let roundtrip = serde_json::to_string(&updates).unwrap();
+        assert_eq!(serde_json::from_str::<ManifestConfig>(&roundtrip).unwrap(), updates);
     }
 
     #[icechunk_macros::test]
@@ -859,7 +1039,7 @@ mod tests {
         config2.clear_virtual_chunk_containers();
 
         // Merge: config2 (empty VCCs) should replace config1's VCCs
-        let merged = config1.merge(config2);
+        let merged = config1.merge(config2).unwrap();
 
         // VCCs should be empty after merge
         assert_eq!(
@@ -896,7 +1076,7 @@ mod tests {
             .unwrap();
 
         // Merge: config2's VCCs should replace config1's VCCs
-        let merged = config1.merge(config2);
+        let merged = config1.merge(config2).unwrap();
 
         let vccs = merged.virtual_chunk_containers.unwrap();
         assert_eq!(vccs.len(), 1, "Should have exactly one VCC after merge");

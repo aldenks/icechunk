@@ -33,8 +33,8 @@ use crate::{
     asset_manager::AssetManager,
     change_set::{ChangeSet, transaction_log_from_change_set},
     config::{
-        Credentials, DEFAULT_MAX_CONCURRENT_REQUESTS, ManifestPreloadCondition,
-        RepositoryConfig,
+        ConfigError, Credentials, DEFAULT_MAX_CONCURRENT_REQUESTS,
+        ManifestPreloadCondition, RepositoryConfig,
     },
     diff::{Diff, DiffBuilder},
     display::AncestryGraph,
@@ -143,8 +143,10 @@ pub enum RepositoryErrorKind {
         "error finding conflicting path for node `{0}`, this probably indicades a bug in `rebase`"
     )]
     ConflictingPathNotFound(NodeId),
-    #[error("error in config deserialization")]
+    #[error("error in config deserialization: {0}")]
     ConfigDeserializationError(#[from] serde_yaml_ng::Error),
+    #[error("invalid repository configuration: {0}")]
+    InvalidConfig(#[from] ConfigError),
     #[error("config was updated by other session")]
     ConfigWasUpdated,
     #[error("branch update conflict: `({expected_parent:?}) != ({actual_parent:?})`")]
@@ -213,6 +215,9 @@ impl Repository {
         check_clean_root: bool,
     ) -> RepositoryResult<Self> {
         debug!("Creating Repository");
+        if let Some(config) = &config {
+            config.validate().capture()?;
+        }
         raise_if_cant_write(storage.as_ref(), "Cannot create repository").await?;
         if storage.can_create_repository().await.inject()?
             == storage::RepositoryCreation::RefusedEmptyPrefix
@@ -361,6 +366,9 @@ impl Repository {
         authorize_virtual_chunk_access: HashMap<String, Option<Credentials>>,
     ) -> RepositoryResult<Self> {
         debug!("Opening Repository");
+        if let Some(config) = &config {
+            config.validate().capture()?;
+        }
 
         // Merge user-provided storage settings with backend defaults upfront so
         // that every code path initializes the shared storage client with the
@@ -423,11 +431,15 @@ impl Repository {
         //   - Persisted repo config (saved alongside the data, if any)
         //   - Backend storage defaults (already merged with user settings above)
         let repo_config = match persisted_config {
-            Some(c) => RepositoryConfig::default().merge(c),
+            Some(c) => RepositoryConfig::default().merge(c).capture()?,
             None => RepositoryConfig::default(),
         };
         // merge user config on top of persisted config and library defaults
-        let merged_config = config.map(|c| repo_config.merge(c)).unwrap_or(repo_config);
+        let merged_config = config
+            .map(|c| repo_config.merge(c))
+            .transpose()
+            .capture()?
+            .unwrap_or(repo_config);
 
         // Re-merge in case persisted config introduced additional storage
         // settings. Note: the S3 client is already initialized with `settings`
@@ -469,6 +481,9 @@ impl Repository {
         create_version: Option<SpecVersionBin>,
         check_clean_root: bool,
     ) -> RepositoryResult<Self> {
+        if let Some(config) = &config {
+            config.validate().capture()?;
+        }
         let storage_defaults = storage.default_settings().await.inject()?;
         let settings = match config.as_ref().and_then(|c| c.storage().cloned()) {
             Some(user_storage) => storage_defaults.merge(user_storage),
@@ -498,6 +513,7 @@ impl Repository {
         asset_manager: Arc<AssetManager>,
         authorized_virtual_containers: HashMap<String, Option<Credentials>>,
     ) -> RepositoryResult<Self> {
+        config.validate().capture()?;
         let containers = config.virtual_chunk_containers().cloned();
         validate_credentials(&config, &authorized_virtual_containers)?;
         let virtual_resolver = Arc::new(VirtualChunkResolver::new(
@@ -608,6 +624,9 @@ impl Repository {
         config: Option<RepositoryConfig>,
         authorize_virtual_chunk_access: Option<HashMap<String, Option<Credentials>>>,
     ) -> RepositoryResult<Self> {
+        if let Some(config) = &config {
+            config.validate().capture()?;
+        }
         // Merge three layers of config (In order of preference):
         //   - User-provided config (passed to reopen())
         //   - Persisted repo config (saved alongside the data, if any)
@@ -616,7 +635,11 @@ impl Repository {
         // merge user config on top of persisted config and library defaults
         // no storage merging happening yet
         let repo_config = self.config().clone();
-        let config = config.map(|c| repo_config.merge(c)).unwrap_or(repo_config);
+        let config = config
+            .map(|c| repo_config.merge(c))
+            .transpose()
+            .capture()?
+            .unwrap_or(repo_config);
         // construct the merged storage settings
         let storage_settings = match config.storage.clone() {
             Some(s) => storage_defaults.merge(s),
@@ -645,6 +668,7 @@ impl Repository {
 
     #[instrument(skip(self))]
     pub fn as_bytes(&self) -> RepositoryResult<Vec<u8>> {
+        self.config.validate().capture()?;
         rmp_serde::to_vec(self).map_err(Box::new).capture()
     }
 
@@ -678,6 +702,7 @@ impl Repository {
 
     #[instrument(skip_all)]
     pub async fn save_config(&self) -> RepositoryResult<storage::VersionInfo> {
+        self.config.validate().capture()?;
         // For V2+ repos, write config into the repo info object atomically
         if self.spec_version >= SpecVersionBin::V2 {
             let config = self.config().clone();
@@ -902,6 +927,7 @@ impl Repository {
         config: &RepositoryConfig,
         previous_version: &storage::VersionInfo,
     ) -> RepositoryResult<storage::VersionInfo> {
+        config.validate().capture()?;
         raise_if_cant_write(storage.as_ref(), "Cannot save configuration").await?;
         let settings = storage.default_settings().await.inject()?;
         let am = AssetManager::new_no_cache(
@@ -2422,6 +2448,132 @@ mod tests {
 
     #[tokio_test]
     #[apply(spec_version_cases)]
+    async fn test_repository_rejects_conflicting_manifest_concurrency(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let conflicting = RepositoryConfig {
+            manifest: Some(ManifestConfig {
+                max_concurrent_manifest_fetches_during_commit: Some(2),
+                max_concurrent_manifest_updates_during_commit: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = Repository::create(
+            Some(conflicting),
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error.kind, RepositoryErrorKind::InvalidConfig(_)));
+        assert!(!Repository::exists(Arc::clone(&storage), None).await?);
+
+        let legacy = RepositoryConfig {
+            manifest: Some(ManifestConfig {
+                max_concurrent_manifest_fetches_during_commit: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = Repository::create(
+            Some(legacy),
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+        let update_override = RepositoryConfig {
+            manifest: Some(ManifestConfig {
+                max_concurrent_manifest_updates_during_commit: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let open_error = Repository::open(
+            Some(update_override.clone()),
+            Arc::clone(&storage),
+            HashMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(open_error.kind, RepositoryErrorKind::InvalidConfig(_)));
+
+        let reopen_error = repo.reopen(Some(update_override), None).await.unwrap_err();
+        assert!(matches!(reopen_error.kind, RepositoryErrorKind::InvalidConfig(_)));
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_repository_rejects_invalid_stored_manifest_concurrency(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+        let conflicting = RepositoryConfig {
+            manifest: Some(ManifestConfig {
+                max_concurrent_manifest_fetches_during_commit: Some(2),
+                max_concurrent_manifest_updates_during_commit: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Bypass repository validation to emulate an invalid config written by an
+        // external or future client.
+        if spec_version >= SpecVersionBin::V2 {
+            let num_updates = repo.config.num_updates_per_repo_info_file();
+            let do_update = move |repo_info: Arc<RepoInfo>, backup_path: &str, _| {
+                Ok(Arc::new(
+                    repo_info
+                        .set_config(spec_version, &conflicting, backup_path, num_updates)
+                        .inject()?,
+                ))
+            };
+            repo.asset_manager
+                .update_repo_info(repo.config.repo_update_retries().retries(), do_update)
+                .await?;
+        } else {
+            let version = repo
+                .asset_manager
+                .try_update_config(&conflicting, &repo.config_version, None)
+                .await?;
+            assert!(version.is_some(), "the test config write must succeed");
+        }
+
+        let override_config = RepositoryConfig {
+            manifest: Some(ManifestConfig {
+                max_concurrent_manifest_updates_during_commit: Some(8),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error =
+            Repository::open(Some(override_config), Arc::clone(&storage), HashMap::new())
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
     async fn test_manage_refs(
         #[case] spec_version: SpecVersionBin,
     ) -> Result<(), Box<dyn Error>> {
@@ -2569,6 +2721,7 @@ mod tests {
             splitting: Some(split_config.clone()),
             virtual_chunk_location_compression: None,
             max_concurrent_manifest_fetches_during_commit: None,
+            max_concurrent_manifest_updates_during_commit: None,
         };
         let config = RepositoryConfig {
             manifest: Some(man_config),
@@ -2598,6 +2751,7 @@ mod tests {
             splitting: Some(split_config.clone()),
             virtual_chunk_location_compression: None,
             max_concurrent_manifest_fetches_during_commit: None,
+            max_concurrent_manifest_updates_during_commit: None,
         };
         let config = RepositoryConfig {
             manifest: Some(man_config),

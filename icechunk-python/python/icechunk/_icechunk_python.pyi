@@ -1008,6 +1008,7 @@ class ManifestConfig:
         virtual_chunk_location_compression: ManifestVirtualChunkLocationCompressionConfig
         | None = None,
         max_concurrent_manifest_fetches_during_commit: int | None = None,
+        max_concurrent_manifest_updates_during_commit: int | None = None,
     ) -> Self:
         """
         Create a new `ManifestConfig` object
@@ -1027,8 +1028,14 @@ class ManifestConfig:
             When None, the default `ManifestVirtualChunkLocationCompressionConfig` is used.
             Default: None
         max_concurrent_manifest_fetches_during_commit: int | None
-            How many manifests are fetched and updated concurrently during a
-            commit, amend, flush, or rewrite_manifests.
+            Legacy name for how many manifests are updated concurrently during a
+            commit, amend, flush, or rewrite_manifests. Mutually exclusive with
+            max_concurrent_manifest_updates_during_commit.
+            Default: 1
+        max_concurrent_manifest_updates_during_commit: int | None
+            How many manifests are updated concurrently during a commit, amend,
+            flush, or rewrite_manifests. Mutually exclusive with
+            max_concurrent_manifest_fetches_during_commit.
             Default: 1
         """
     @property
@@ -1109,8 +1116,9 @@ class ManifestConfig:
     @property
     def max_concurrent_manifest_fetches_during_commit(self) -> int | None:
         """
-        How many manifests are fetched and updated concurrently during a
-        commit, amend, flush, or rewrite_manifests.
+        Legacy name for how many manifests are updated concurrently during a
+        commit, amend, flush, or rewrite_manifests. Mutually exclusive with
+        max_concurrent_manifest_updates_during_commit.
 
         Default: 1
 
@@ -1130,6 +1138,33 @@ class ManifestConfig:
         ----------
         value: int | None
             The number of manifests to fetch and update concurrently.
+        """
+
+    @property
+    def max_concurrent_manifest_updates_during_commit(self) -> int | None:
+        """
+        How many manifests are updated concurrently during a commit, amend,
+        flush, or rewrite_manifests.
+
+        Mutually exclusive with max_concurrent_manifest_fetches_during_commit.
+        Default: 1
+
+        Returns
+        -------
+        int | None
+            The number of manifests updated concurrently during a commit.
+        """
+
+    @max_concurrent_manifest_updates_during_commit.setter
+    def max_concurrent_manifest_updates_during_commit(self, value: int | None) -> None:
+        """
+        Set how many manifests are updated concurrently during a commit, amend,
+        flush, or rewrite_manifests.
+
+        Parameters
+        ----------
+        value: int | None
+            The number of manifests to update concurrently.
         """
 
 class StorageRetriesSettings:

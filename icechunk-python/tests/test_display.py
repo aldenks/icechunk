@@ -444,7 +444,17 @@ class TestReprStructural:
         assert "splitting" in repr_str
         assert "virtual_chunk_location_compression" in repr_str
         assert "max_concurrent_manifest_fetches_during_commit" in repr_str
-        assert "max_concurrent_manifest_fetches_during_commit: 1 (default)" in str(c)
+        assert "max_concurrent_manifest_updates_during_commit" in repr_str
+        assert "max_concurrent_manifest_fetches_during_commit: None" in str(c)
+        assert "max_concurrent_manifest_updates_during_commit: 1 (default)" in str(c)
+
+        legacy = ManifestConfig(max_concurrent_manifest_fetches_during_commit=16)
+        assert "max_concurrent_manifest_fetches_during_commit: 16" in str(legacy)
+        assert "max_concurrent_manifest_updates_during_commit: None" in str(legacy)
+
+        updates = ManifestConfig(max_concurrent_manifest_updates_during_commit=8)
+        assert "max_concurrent_manifest_fetches_during_commit: None" in str(updates)
+        assert "max_concurrent_manifest_updates_during_commit: 8" in str(updates)
 
     def test_virtual_chunk_container_shows_fields(self) -> None:
         store_config = icechunk.s3_store(

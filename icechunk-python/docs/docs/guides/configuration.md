@@ -160,17 +160,42 @@ config.manifest = ic.config.ManifestConfig(
 )
 ```
 
-#### [`max_concurrent_manifest_fetches_during_commit`](../reference/config.md#icechunk.config.ManifestConfig.max_concurrent_manifest_fetches_during_commit)
+#### [`max_concurrent_manifest_updates_during_commit`](../reference/config.md#icechunk.config.ManifestConfig.max_concurrent_manifest_updates_during_commit)
 
-How many manifests are fetched and updated concurrently during a commit, amend,
+How many arrays’ manifests are updated concurrently during a commit, amend,
 flush, or `rewrite_manifests`. Each changed array's manifest update downloads,
 decompresses, merges, recompresses, and uploads its manifest(s), so raising this
 trades memory for lower commit latency on datasets with many arrays. Defaults to
 `1` (serial).
 
 ```python exec="on" session="config" source="material-block"
-config.manifest.max_concurrent_manifest_fetches_during_commit = 16
+config.manifest.max_concurrent_manifest_updates_during_commit = 16
 ```
+
+`max_concurrent_manifest_fetches_during_commit` is the legacy name for the same
+setting. Existing configurations may continue to use it, but it cannot be set at
+the same time as `max_concurrent_manifest_updates_during_commit`. Icechunk rejects
+configurations containing both names, including when one comes from stored
+repository configuration and the other comes from an open or reopen override.
+A repository with a stored legacy value must keep using that name when changing
+the value. Overrides cannot clear stored fields, so there is currently no
+in-place migration to the new name through the configuration API.
+
+The limit applies to live manifest-update pipelines across arrays. Splits within
+one array are still processed serially. CPU-heavy merge, manifest construction,
+and compression work runs on the blocking pool behind a separate internal gate
+sized from `available_parallelism` for each asset manager; the configured value bounds pipelines, not OS
+threads or whole-process RSS. The manifest cache, pending session changes,
+snapshot data, compression scratch space, and other process state remain separate
+memory costs, so do not assume total memory grows strictly linearly with this
+setting.
+
+CPU offload applies unconditionally, including at the default of `1`; both names
+behave identically. Already admitted CPU work keeps its permit and memory until
+it finishes, even when the commit fails or is cancelled.
+Older Icechunk clients ignore the new serialized key and therefore use their
+default unless the legacy key is present. Use the legacy name for repository
+configurations shared with older writers; do not set both names to non-`None` values.
 
 ### Applying Configuration
 

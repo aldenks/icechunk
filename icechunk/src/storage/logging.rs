@@ -4,7 +4,10 @@ use std::{
     fmt,
     ops::Range,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -28,12 +31,19 @@ pub struct LoggingStorage {
     /// backend, `Some` overrides it either way.
     #[serde(default)]
     native_id_prefixes: Option<bool>,
+    #[serde(skip)]
+    fail_manifest_writes: AtomicBool,
 }
 
 #[cfg(test)]
 impl LoggingStorage {
     pub fn new(backend: Arc<dyn Storage + Send + Sync>) -> Self {
-        Self { backend, fetch_log: Mutex::new(Vec::new()), native_id_prefixes: None }
+        Self {
+            backend,
+            fetch_log: Mutex::new(Vec::new()),
+            native_id_prefixes: None,
+            fail_manifest_writes: AtomicBool::new(false),
+        }
     }
 
     /// Report `native` from `lists_id_prefixes_natively` instead of what the
@@ -49,6 +59,10 @@ impl LoggingStorage {
 
     pub fn clear(&self) {
         self.fetch_log.lock().expect("poison lock").clear();
+    }
+
+    pub fn fail_manifest_writes(&self, fail: bool) {
+        self.fail_manifest_writes.store(fail, Ordering::SeqCst);
     }
 }
 
@@ -92,6 +106,13 @@ impl Storage for LoggingStorage {
             .lock()
             .expect("poison lock")
             .push(("put_object".to_string(), path.to_string()));
+        if path.starts_with("manifests/")
+            && self.fail_manifest_writes.load(Ordering::SeqCst)
+        {
+            return Err(StorageError::capture(super::StorageErrorKind::Other(
+                "injected manifest upload failure".to_string(),
+            )));
+        }
         self.backend
             .put_object(settings, path, bytes, content_type, metadata, previous_version)
             .await

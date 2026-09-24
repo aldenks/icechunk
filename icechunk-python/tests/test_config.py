@@ -262,6 +262,115 @@ def test_can_change_deep_config_values(any_spec_version: int | None) -> None:
     assert vlc.compression_level == 5
 
 
+def test_manifest_update_concurrency_config(any_spec_version: int | None) -> None:
+    config = icechunk.ManifestConfig(max_concurrent_manifest_updates_during_commit=0)
+    assert config.max_concurrent_manifest_updates_during_commit == 0
+    assert config.max_concurrent_manifest_fetches_during_commit is None
+
+    config.max_concurrent_manifest_updates_during_commit = 7
+    storage = icechunk.in_memory_storage()
+    icechunk.Repository.create(
+        storage=storage,
+        config=icechunk.RepositoryConfig(manifest=config),
+        spec_version=any_spec_version,
+    )
+    stored = icechunk.Repository.fetch_config(storage)
+    assert stored is not None
+    assert stored.manifest is not None
+    assert stored.manifest.max_concurrent_manifest_updates_during_commit == 7
+    assert stored.manifest.max_concurrent_manifest_fetches_during_commit is None
+
+
+def test_manifest_commit_concurrency_fields_are_mutually_exclusive() -> None:
+    conflict = "mutually exclusive"
+    with pytest.raises(ValueError, match=conflict):
+        icechunk.ManifestConfig(
+            max_concurrent_manifest_fetches_during_commit=2,
+            max_concurrent_manifest_updates_during_commit=4,
+        )
+
+    config = icechunk.ManifestConfig(max_concurrent_manifest_fetches_during_commit=2)
+    with pytest.raises(ValueError, match=conflict):
+        config.max_concurrent_manifest_updates_during_commit = 4
+    assert config.max_concurrent_manifest_updates_during_commit is None
+
+    config.max_concurrent_manifest_fetches_during_commit = None
+    config.max_concurrent_manifest_updates_during_commit = 4
+    with pytest.raises(ValueError, match=conflict):
+        config.max_concurrent_manifest_fetches_during_commit = 2
+    assert config.max_concurrent_manifest_fetches_during_commit is None
+
+    with pytest.raises(OverflowError):
+        icechunk.ManifestConfig(max_concurrent_manifest_updates_during_commit=65_536)
+    with pytest.raises(OverflowError):
+        config.max_concurrent_manifest_updates_during_commit = 65_536
+
+    legacy_repo_config = icechunk.RepositoryConfig(
+        manifest=icechunk.ManifestConfig(max_concurrent_manifest_fetches_during_commit=2)
+    )
+    update_repo_config = icechunk.RepositoryConfig(
+        manifest=icechunk.ManifestConfig(max_concurrent_manifest_updates_during_commit=4)
+    )
+    with pytest.raises(ValueError, match=conflict):
+        legacy_repo_config.merge(update_repo_config)
+
+
+@pytest.mark.parametrize(
+    ("stored_field", "override_field"),
+    [
+        (
+            "max_concurrent_manifest_fetches_during_commit",
+            "max_concurrent_manifest_updates_during_commit",
+        ),
+        (
+            "max_concurrent_manifest_updates_during_commit",
+            "max_concurrent_manifest_fetches_during_commit",
+        ),
+    ],
+)
+def test_stored_and_override_manifest_concurrency_conflict(
+    stored_field: str,
+    override_field: str,
+    any_spec_version: int | None,
+) -> None:
+    storage = icechunk.in_memory_storage()
+    stored_manifest = icechunk.ManifestConfig(**{stored_field: 2})
+    icechunk.Repository.create(
+        storage=storage,
+        config=icechunk.RepositoryConfig(manifest=stored_manifest),
+        spec_version=any_spec_version,
+    )
+
+    override_manifest = icechunk.ManifestConfig(**{override_field: 4})
+    with pytest.raises(icechunk.InvalidInputError, match="mutually exclusive") as error:
+        icechunk.Repository.open(
+            storage=storage,
+            config=icechunk.RepositoryConfig(manifest=override_manifest),
+        )
+    assert error.value.kind == "invalid-repository-configuration"
+
+    # Clearing the field on a config copy does not clear the stored value.
+    repo = icechunk.Repository.open(storage)
+    changed = repo.config
+    assert changed.manifest is not None
+    setattr(changed.manifest, stored_field, None)
+    setattr(changed.manifest, override_field, 4)
+    with pytest.raises(icechunk.InvalidInputError, match="mutually exclusive"):
+        repo.reopen(config=changed)
+
+
+def test_invalid_stored_manifest_config_is_format_error(tmp_path: Path) -> None:
+    storage = icechunk.local_filesystem_storage(str(tmp_path))
+    icechunk.Repository.create(storage, spec_version=1)
+    (tmp_path / "config.yaml").write_text(
+        "manifest:\n"
+        "  max_concurrent_manifest_fetches_during_commit: 2\n"
+        "  max_concurrent_manifest_updates_during_commit: 4\n"
+    )
+    with pytest.raises(icechunk.FormatError, match="mutually exclusive"):
+        icechunk.Repository.open(storage)
+
+
 def test_manifest_preload_magic_methods() -> None:
     assert (
         icechunk.ManifestPreloadCondition.and_conditions(

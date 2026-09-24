@@ -311,7 +311,7 @@ pub struct CommitBuilder<'a> {
     session: &'a mut Session,
     message: String,
     properties: Option<SnapshotProperties>,
-    max_concurrent_nodes: usize,
+    max_concurrent_nodes: Option<usize>,
     allow_empty: bool,
     amend: bool,
     kind: CommitKind,
@@ -332,14 +332,11 @@ impl std::fmt::Debug for CommitBuilder<'_> {
 
 impl<'a> CommitBuilder<'a> {
     fn new(session: &'a mut Session, message: String) -> Self {
-        let max_concurrent_nodes = usize::from(
-            session.config().manifest().max_concurrent_manifest_fetches_during_commit(),
-        );
         Self {
             session,
             message,
             properties: None,
-            max_concurrent_nodes,
+            max_concurrent_nodes: None,
             allow_empty: false,
             amend: false,
             kind: CommitKind::NewCommit,
@@ -356,7 +353,7 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub fn max_concurrent_nodes(mut self, n: usize) -> Self {
-        self.max_concurrent_nodes = n.max(1); // Must be > 0 to flush
+        self.max_concurrent_nodes = Some(n.max(1)); // Must be > 0 to flush
         self
     }
 
@@ -409,6 +406,18 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub async fn execute(self) -> SessionResult<SnapshotId> {
+        // Validate even when a caller supplied an explicit builder override:
+        // an override must not hide a conflicting repository configuration.
+        let configured_concurrency = self
+            .session
+            .config()
+            .manifest()
+            .max_concurrent_manifest_updates_during_commit()
+            .capture::<RepositoryErrorKind>()
+            .inject()?;
+        let max_concurrent_nodes = self
+            .max_concurrent_nodes
+            .unwrap_or_else(|| usize::from(configured_concurrency));
         let has_rebase = self.rebase_solver.is_some();
         let has_hooks = self.before_rebase.is_some() || self.after_rebase.is_some();
 
@@ -463,7 +472,7 @@ impl<'a> CommitBuilder<'a> {
                 self.session
                     .do_flush(
                         &self.message,
-                        self.max_concurrent_nodes,
+                        max_concurrent_nodes,
                         self.properties,
                         register,
                     )
@@ -473,7 +482,7 @@ impl<'a> CommitBuilder<'a> {
                 self.session
                     .do_rewrite_manifests(
                         &self.message,
-                        self.max_concurrent_nodes,
+                        max_concurrent_nodes,
                         self.properties,
                         commit_method,
                     )
@@ -486,7 +495,7 @@ impl<'a> CommitBuilder<'a> {
                             solver,
                             self.rebase_attempts,
                             &self.message,
-                            self.max_concurrent_nodes,
+                            max_concurrent_nodes,
                             self.properties,
                             self.allow_empty,
                             self.before_rebase,
@@ -497,7 +506,7 @@ impl<'a> CommitBuilder<'a> {
                     self.session
                         .commit_inner(
                             &self.message,
-                            self.max_concurrent_nodes,
+                            max_concurrent_nodes,
                             self.properties,
                             false,
                             commit_method,
@@ -2618,36 +2627,43 @@ struct NodeFlushResult {
     manifest_files: Vec<ManifestFileInfo>,
 }
 
-async fn write_manifest_from_stream(
+async fn write_manifest_from_chunks(
     asset_manager: &AssetManager,
     manifest_config: &ManifestConfig,
-    chunks: impl Stream<Item = SessionResult<ChunkInfo>>,
+    chunks: impl FnOnce() -> Vec<ChunkInfo> + Send + 'static,
 ) -> SessionResult<Option<(ManifestRef, ManifestFileInfo)>> {
-    let mut from = vec![];
-    let mut to = vec![];
-    let chunks = aggregate_extents(&mut from, &mut to, chunks, |ci| &ci.coord);
-
     let compression_config: Option<LocationCompressionConfig> =
         if asset_manager.spec_version() >= SpecVersionBin::V2 {
             Some(manifest_config.virtual_chunk_location_compression().into())
         } else {
             None
         };
-    let mut all: Vec<ChunkInfo> = chunks.try_collect().await?;
-    all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
-    if let Some(new_manifest) =
-        Manifest::from_sorted_vec(&ManifestId::random(), all, compression_config.as_ref())
-            .inject()?
-    {
+    let (new_manifest, extents) = asset_manager
+        .run_manifest_cpu(move || -> SessionResult<_> {
+            let mut all = chunks();
+            let mut from = Vec::new();
+            let mut to = Vec::new();
+            for chunk in &all {
+                extend_extents(&mut from, &mut to, &chunk.coord);
+            }
+            all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
+            let manifest = Manifest::from_sorted_vec(
+                &ManifestId::random(),
+                all,
+                compression_config.as_ref(),
+            )
+            .inject()?;
+            Ok((manifest, ManifestExtents::new(&from, &to)))
+        })
+        .await
+        .inject()??;
+    if let Some(new_manifest) = new_manifest {
         let new_manifest = Arc::new(new_manifest);
         let new_manifest_size =
             asset_manager.write_manifest(Arc::clone(&new_manifest)).await.inject()?;
 
         let file_info = ManifestFileInfo::new(new_manifest.as_ref(), new_manifest_size);
-        let new_ref = ManifestRef {
-            object_id: new_manifest.id().clone(),
-            extents: ManifestExtents::new(&from, &to),
-        };
+        let new_ref = ManifestRef { object_id: new_manifest.id().clone(), extents };
         Ok(Some((new_ref, file_info)))
     } else {
         Ok(None)
@@ -2666,44 +2682,41 @@ async fn write_manifest_with_changes(
     node_id: &NodeId,
     old_snapshot_id: &SnapshotId,
 ) -> SessionResult<Option<(ManifestRef, ManifestFileInfo)>> {
-    // First add chunks from previous manifests that are not modified
-    let futs = previous_manifests
-        .map(|mref| fetch_manifest(&mref.object_id, old_snapshot_id, asset_manager))
-        .collect::<Vec<_>>();
-
-    // Hardcoded to 1: this fetches manifests for a single extent within a single node.
-    // Node-level parallelism is already controlled by max_concurrent_nodes in the
-    // caller (do_flush), so adding concurrency here would compound it.
-    let mut all_chunks_vec = stream::iter(futs)
-        .buffer_unordered(1)
-        .try_fold(Vec::with_capacity(modified_chunks.len()), |mut acc, manifest| async {
-            acc.extend(manifest.iter(node_id.clone()).inject()?.filter_map_ok(
-                |(idx, payload)| {
+    // Retain only one decoded source at a time, including when a new split
+    // intersects many old manifests. Node scheduling bounds active pipelines.
+    let mut all_chunks_vec = Vec::with_capacity(modified_chunks.len());
+    let mut modified_chunks = modified_chunks;
+    for mref in previous_manifests {
+        let manifest =
+            fetch_manifest(&mref.object_id, old_snapshot_id, asset_manager).await?;
+        let node_id = node_id.clone();
+        let extent = extent.clone();
+        (all_chunks_vec, modified_chunks) = asset_manager
+            .run_manifest_cpu(move || -> SessionResult<_> {
+                for chunk in manifest.iter(node_id.clone()).inject()? {
+                    let (idx, payload) = chunk.inject()?;
                     if !modified_chunks.contains_key(&idx) && extent.contains(&idx.0) {
-                        Some(ChunkInfo { node: node_id.clone(), coord: idx, payload })
-                    } else {
-                        None
+                        all_chunks_vec.push(ChunkInfo {
+                            node: node_id.clone(),
+                            coord: idx,
+                            payload,
+                        });
                     }
-                },
-            ));
-            Ok(acc)
-        })
-        .await?;
-
-    // Then add modified chunks from ChangeSet
-    all_chunks_vec.extend(modified_chunks.into_iter().filter_map(
-        |(idx, maybe_payload)| {
-            maybe_payload.map(|payload| {
-                Ok(ChunkInfo { node: node_id.clone(), coord: idx, payload })
+                }
+                Ok((all_chunks_vec, modified_chunks))
             })
-        },
-    ));
+            .await
+            .inject()??;
+    }
 
-    write_manifest_from_stream(
-        asset_manager,
-        manifest_config,
-        stream::iter(all_chunks_vec).map_err(|e| e.inject()),
-    )
+    let node_id = node_id.clone();
+    let modified = modified_chunks.into_iter().filter_map(move |(coord, payload)| {
+        payload.map(|payload| ChunkInfo { node: node_id.clone(), coord, payload })
+    });
+    write_manifest_from_chunks(asset_manager, manifest_config, move || {
+        all_chunks_vec.extend(modified);
+        all_chunks_vec
+    })
     .await
 }
 
@@ -2870,28 +2883,27 @@ async fn flush_new_node(
 
     for extent in splits.iter() {
         if change_set.array_manifest(node_id).is_some() {
-            let chunks = stream::iter(
-                change_set
-                    .array_chunks_iterator(node_id, node_path)
-                    // FIXME: do we need to optimize this so we don't need multiple passes over all chunks calling
-                    // contains?
-                    .filter_map(|(coord, payload)| {
-                        if let Some(payload) = payload
-                            && extent.contains(&coord.0)
-                        {
-                            Some(ChunkInfo {
-                                node: node_id.clone(),
-                                coord: coord.clone(),
-                                payload: payload.clone(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .map(Ok),
-            );
+            let chunks: Vec<_> = change_set
+                .array_chunks_iterator(node_id, node_path)
+                // FIXME: do we need to optimize this so we don't need multiple passes over all chunks calling
+                // contains?
+                .filter_map(|(coord, payload)| {
+                    if let Some(payload) = payload
+                        && extent.contains(&coord.0)
+                    {
+                        Some(ChunkInfo {
+                            node: node_id.clone(),
+                            coord: coord.clone(),
+                            payload: payload.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             if let Some((new_ref, file_info)) =
-                write_manifest_from_stream(asset_manager, manifest_config, chunks).await?
+                write_manifest_from_chunks(asset_manager, manifest_config, move || chunks)
+                    .await?
             {
                 result.manifest_refs.push(new_ref);
                 result.manifest_files.push(file_info);
@@ -3491,61 +3503,17 @@ async fn fetch_manifest(
     asset_manager.fetch_manifest(manifest_id, manifest_info.size_bytes).await.inject()
 }
 
-/// Map the iterator to accumulate the extents of the chunks traversed
-///
-/// As we are processing chunks to create a manifest, we need to keep track
-/// of the extents of the manifests. This means, for each coordinate, we need
-/// to record its minimum and maximum values.
-///
-/// This very ugly code does that, without having to traverse the iterator twice.
-/// It adapts the stream using [`StreamExt::map_ok`] and keeps a running min/max
-/// for each coordinate.
-///
-/// When the iterator is fully traversed, the min and max values will be
-/// available in `from` and `to` arguments.
-///
-/// Yes, this is horrible.
-fn aggregate_extents<'a, T: std::fmt::Debug, E>(
-    from: &'a mut Vec<u32>,
-    to: &'a mut Vec<u32>,
-    it: impl Stream<Item = Result<T, E>> + 'a,
-    extract_index: impl for<'b> Fn(&'b T) -> &'b ChunkIndices + 'a,
-) -> impl Stream<Item = Result<T, E>> + 'a {
-    // we initialize the destination with an empty array, because we don't know
-    // the dimensions of the array yet. On the first element we will re-initialize
-    *from = Vec::new();
-    *to = Vec::new();
-    it.map_ok(move |t| {
-        // these are the coordinates for the chunk
-        let idx = extract_index(&t);
-
-        // we need to initialize the mins/maxes the first time
-        // we initialize with the value of the first element
-        // this obviously doesn't work for empty streams
-        // but we never generate manifests for them
-        if from.is_empty() {
-            *from = idx.0.clone();
-            // important to remember that `to` is not inclusive, so we need +1
-            *to = idx.0.iter().map(|n| n + 1).collect();
-        } else {
-            // We need to iterate over coordinates, and update the
-            // minimum and maximum for each if needed
-            for (coord_idx, value) in idx.0.iter().enumerate() {
-                if let Some(from_current) = from.get_mut(coord_idx)
-                    && value < from_current
-                {
-                    *from_current = *value;
-                }
-                if let Some(to_current) = to.get_mut(coord_idx) {
-                    let range_value = value + 1;
-                    if range_value > *to_current {
-                        *to_current = range_value;
-                    }
-                }
-            }
+/// Extend half-open manifest bounds to include one chunk coordinate.
+fn extend_extents(from: &mut Vec<u32>, to: &mut Vec<u32>, idx: &ChunkIndices) {
+    if from.is_empty() {
+        *from = idx.0.clone();
+        *to = idx.0.iter().map(|n| n + 1).collect();
+    } else {
+        for ((low, high), value) in from.iter_mut().zip(to.iter_mut()).zip(&idx.0) {
+            *low = (*low).min(*value);
+            *high = (*high).max(value + 1);
         }
-        t
-    })
+    }
 }
 
 #[cfg(test)]
@@ -3777,16 +3745,9 @@ mod tests {
             indices.iter().map(|i| i.0[2]).max().unwrap() + 1,
         ];
 
-        let _ = aggregate_extents(
-            &mut from,
-            &mut to,
-            stream::iter(
-                indices.into_iter().map(Ok::<ChunkIndices, std::convert::Infallible>),
-            ),
-            |idx| idx,
-        )
-        .count()
-        .await;
+        for idx in &indices {
+            extend_extents(&mut from, &mut to, idx);
+        }
 
         prop_assert_eq!(from, expected_from);
         prop_assert_eq!(to, expected_to);
@@ -3906,6 +3867,157 @@ mod tests {
         .await?;
         let (array_path, bytes, snapshot) = write_array_and_commit(&repo, None).await?;
         assert_chunk_readable(&repo, &array_path, bytes, snapshot).await
+    }
+
+    #[tokio_test]
+    async fn commit_override_does_not_hide_conflicting_config()
+    -> Result<(), Box<dyn Error>> {
+        let repo = create_memory_store_repository(SpecVersionBin::V2).await;
+        let mut session = repo.writable_session("main").await?;
+        let parent = session.snapshot_id().clone();
+        // Public raw Session constructors also accept directly constructed Rust
+        // configs, so commit must validate independently of Repository::create.
+        session.config.manifest = Some(ManifestConfig {
+            max_concurrent_manifest_fetches_during_commit: Some(4),
+            max_concurrent_manifest_updates_during_commit: Some(4),
+            ..Default::default()
+        });
+        session.add_group(Path::root(), Bytes::new()).await?;
+        let error = session
+            .commit("invalid")
+            .max_concurrent_nodes(4)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
+        assert_eq!(repo.lookup_branch("main").await?, parent);
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn parallel_manifest_update_failure_preserves_branch_and_changes(
+        #[case] spec_version: SpecVersionBin,
+        #[values(false, true)] fail_upload: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let logging = Arc::new(LoggingStorage::new(new_in_memory_storage().await?));
+        let storage: Arc<dyn Storage + Send + Sync> = Arc::clone(&logging) as _;
+        let repo = Repository::create(
+            Some(RepositoryConfig {
+                caching: Some(crate::config::CachingConfig {
+                    num_chunk_refs: Some(0),
+                    ..Default::default()
+                }),
+                max_concurrent_decodes: Some(1),
+                manifest: Some(ManifestConfig {
+                    max_concurrent_manifest_fetches_during_commit: (spec_version
+                        == SpecVersionBin::V1)
+                        .then_some(4),
+                    max_concurrent_manifest_updates_during_commit: (spec_version
+                        == SpecVersionBin::V2)
+                        .then_some(4),
+                    splitting: Some(ManifestSplittingConfig {
+                        split_sizes: Some(vec![(
+                            ManifestSplitCondition::AnyArray,
+                            vec![ManifestSplitDim {
+                                condition: ManifestSplitDimCondition::Any,
+                                num_chunks: 2,
+                            }],
+                        )]),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::new()).await?;
+        let paths: Vec<Path> =
+            (0..4).map(|n| Path::new(&format!("/array{n}")).unwrap()).collect();
+        for path in &paths {
+            session
+                .add_array(
+                    path.clone(),
+                    ArrayShape::new(vec![(8, 8)]).unwrap(),
+                    None,
+                    Bytes::new(),
+                )
+                .await?;
+            for index in 0..6 {
+                session
+                    .set_chunk_ref(
+                        path.clone(),
+                        ChunkIndices(vec![index]),
+                        Some(ChunkPayload::Inline(Bytes::from_static(b"old"))),
+                    )
+                    .await?;
+            }
+        }
+        let parent = session.commit("initial").execute().await?;
+        let mut session = repo.writable_session("main").await?;
+        let NodeData::Array { manifests, .. } =
+            session.get_array(&paths[0]).await?.node_data
+        else {
+            unreachable!()
+        };
+        let id = &manifests[0].object_id;
+        let original = repo.asset_manager().fetch_manifest_bytes(id, 0).await?;
+        let mut corrupt = original.clone();
+        corrupt[0] ^= 0xff;
+        let settings = storage.default_settings().await?;
+        let object_path = format!("manifests/{id}");
+        if !fail_upload {
+            storage
+                .put_object(&settings, &object_path, corrupt.into(), None, vec![], None)
+                .await?;
+        }
+
+        for path in &paths {
+            for (index, payload) in [
+                (0, Some(ChunkPayload::Inline(Bytes::from_static(b"updated")))),
+                (3, None),
+                (6, Some(ChunkPayload::Inline(Bytes::from_static(b"appended")))),
+            ] {
+                session
+                    .set_chunk_ref(path.clone(), ChunkIndices(vec![index]), payload)
+                    .await?;
+            }
+        }
+        logging.fail_manifest_writes(fail_upload);
+        let error = session.commit("fails").execute().await.unwrap_err();
+        if fail_upload {
+            assert!(error.to_string().contains("injected manifest upload failure"));
+        }
+        assert_eq!(repo.lookup_branch("main").await?, parent);
+        assert_eq!(session.snapshot_id(), &parent);
+
+        logging.fail_manifest_writes(false);
+        storage
+            .put_object(&settings, &object_path, original.into(), None, vec![], None)
+            .await?;
+        let head = session.commit("retry").execute().await?;
+        let read = repo.readonly_session(&VersionInfo::SnapshotId(head)).await?;
+        for path in &paths {
+            for index in 0..8 {
+                let expected = match index {
+                    0 => Some(Bytes::from_static(b"updated")),
+                    3 | 7 => None,
+                    6 => Some(Bytes::from_static(b"appended")),
+                    _ => Some(Bytes::from_static(b"old")),
+                }
+                .map(ChunkPayload::Inline);
+                assert_eq!(
+                    read.get_chunk_ref(path, &ChunkIndices(vec![index])).await?,
+                    expected
+                );
+            }
+        }
+        Ok(())
     }
 
     #[tokio_test]

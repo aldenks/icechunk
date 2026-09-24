@@ -2306,8 +2306,8 @@ pub struct PyManifestConfig {
     #[pyo3(get, set)]
     pub virtual_chunk_location_compression:
         Option<Py<PyManifestVirtualChunkLocationCompressionConfig>>,
-    #[pyo3(get, set)]
     pub max_concurrent_manifest_fetches_during_commit: Option<u16>,
+    pub max_concurrent_manifest_updates_during_commit: Option<u16>,
 }
 
 impl PyRepr for PyManifestConfig {
@@ -2316,6 +2316,20 @@ impl PyRepr for PyManifestConfig {
         "icechunk.config.ManifestConfig"
     }
     fn fields(&self, mode: ReprMode) -> Vec<(&str, String)> {
+        let legacy_concurrency =
+            py_option(&self.max_concurrent_manifest_fetches_during_commit);
+        let update_concurrency =
+            if self.max_concurrent_manifest_fetches_during_commit.is_none()
+                && self.max_concurrent_manifest_updates_during_commit.is_none()
+            {
+                py_option_or_default(
+                    &self.max_concurrent_manifest_updates_during_commit,
+                    "1",
+                    mode,
+                )
+            } else {
+                py_option(&self.max_concurrent_manifest_updates_during_commit)
+            };
         vec![
             (
                 "preload",
@@ -2337,16 +2351,8 @@ impl PyRepr for PyManifestConfig {
                     || ManifestVirtualChunkLocationCompressionConfig::default().into(),
                 ),
             ),
-            (
-                "max_concurrent_manifest_fetches_during_commit",
-                py_option_or_default(
-                    &self.max_concurrent_manifest_fetches_during_commit,
-                    &ManifestConfig::default()
-                        .max_concurrent_manifest_fetches_during_commit()
-                        .to_string(),
-                    mode,
-                ),
-            ),
+            ("max_concurrent_manifest_fetches_during_commit", legacy_concurrency),
+            ("max_concurrent_manifest_updates_during_commit", update_concurrency),
         ]
     }
 }
@@ -2354,7 +2360,7 @@ impl PyRepr for PyManifestConfig {
 #[pymethods]
 impl PyManifestConfig {
     #[new]
-    #[pyo3(signature = (preload=None, splitting=None, virtual_chunk_location_compression=None, max_concurrent_manifest_fetches_during_commit=None))]
+    #[pyo3(signature = (preload=None, splitting=None, virtual_chunk_location_compression=None, max_concurrent_manifest_fetches_during_commit=None, max_concurrent_manifest_updates_during_commit=None))]
     fn new(
         preload: Option<Py<PyManifestPreloadConfig>>,
         splitting: Option<Py<PyManifestSplittingConfig>>,
@@ -2362,13 +2368,59 @@ impl PyManifestConfig {
             Py<PyManifestVirtualChunkLocationCompressionConfig>,
         >,
         max_concurrent_manifest_fetches_during_commit: Option<u16>,
-    ) -> Self {
-        Self {
+        max_concurrent_manifest_updates_during_commit: Option<u16>,
+    ) -> PyResult<Self> {
+        let result = Self {
             preload,
             splitting,
             virtual_chunk_location_compression,
             max_concurrent_manifest_fetches_during_commit,
+            max_concurrent_manifest_updates_during_commit,
+        };
+        let config: ManifestConfig =
+            (&result).try_into().map_err(PyValueError::new_err)?;
+        config.validate().map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(result)
+    }
+
+    #[getter]
+    fn max_concurrent_manifest_fetches_during_commit(&self) -> Option<u16> {
+        self.max_concurrent_manifest_fetches_during_commit
+    }
+
+    #[setter]
+    fn set_max_concurrent_manifest_fetches_during_commit(
+        &mut self,
+        value: Option<u16>,
+    ) -> PyResult<()> {
+        if value.is_some() && self.max_concurrent_manifest_updates_during_commit.is_some()
+        {
+            return Err(PyValueError::new_err(
+                "max_concurrent_manifest_updates_during_commit and max_concurrent_manifest_fetches_during_commit are mutually exclusive",
+            ));
         }
+        self.max_concurrent_manifest_fetches_during_commit = value;
+        Ok(())
+    }
+
+    #[getter]
+    fn max_concurrent_manifest_updates_during_commit(&self) -> Option<u16> {
+        self.max_concurrent_manifest_updates_during_commit
+    }
+
+    #[setter]
+    fn set_max_concurrent_manifest_updates_during_commit(
+        &mut self,
+        value: Option<u16>,
+    ) -> PyResult<()> {
+        if value.is_some() && self.max_concurrent_manifest_fetches_during_commit.is_some()
+        {
+            return Err(PyValueError::new_err(
+                "max_concurrent_manifest_updates_during_commit and max_concurrent_manifest_fetches_during_commit are mutually exclusive",
+            ));
+        }
+        self.max_concurrent_manifest_updates_during_commit = value;
+        Ok(())
     }
 
     pub fn __repr__(&self) -> String {
@@ -2384,23 +2436,31 @@ impl PyManifestConfig {
 
 impl PartialEq for PyManifestConfig {
     fn eq(&self, other: &Self) -> bool {
-        let x: ManifestConfig = self.into();
-        let y: ManifestConfig = other.into();
+        let x: Result<ManifestConfig, _> = self.try_into();
+        let y: Result<ManifestConfig, _> = other.try_into();
         x == y
     }
 }
 
-impl From<&PyManifestConfig> for ManifestConfig {
-    fn from(value: &PyManifestConfig) -> Self {
-        Python::attach(|py| Self {
-            preload: value.preload.as_ref().map(|c| (&*c.borrow(py)).into()),
-            splitting: value.splitting.as_ref().map(|c| (&*c.borrow(py)).into()),
-            virtual_chunk_location_compression: value
-                .virtual_chunk_location_compression
-                .as_ref()
-                .map(|c| (&*c.borrow(py)).into()),
-            max_concurrent_manifest_fetches_during_commit: value
-                .max_concurrent_manifest_fetches_during_commit,
+impl TryFrom<&PyManifestConfig> for ManifestConfig {
+    type Error = String;
+
+    fn try_from(value: &PyManifestConfig) -> Result<Self, Self::Error> {
+        Python::attach(|py| {
+            let config = Self {
+                preload: value.preload.as_ref().map(|c| (&*c.borrow(py)).into()),
+                splitting: value.splitting.as_ref().map(|c| (&*c.borrow(py)).into()),
+                virtual_chunk_location_compression: value
+                    .virtual_chunk_location_compression
+                    .as_ref()
+                    .map(|c| (&*c.borrow(py)).into()),
+                max_concurrent_manifest_fetches_during_commit: value
+                    .max_concurrent_manifest_fetches_during_commit,
+                max_concurrent_manifest_updates_during_commit: value
+                    .max_concurrent_manifest_updates_during_commit,
+            };
+            config.validate().map_err(|error| error.to_string())?;
+            Ok(config)
         })
     }
 }
@@ -2431,6 +2491,8 @@ impl From<ManifestConfig> for PyManifestConfig {
                 }),
             max_concurrent_manifest_fetches_during_commit: value
                 .max_concurrent_manifest_fetches_during_commit,
+            max_concurrent_manifest_updates_during_commit: value
+                .max_concurrent_manifest_updates_during_commit,
         }
         })
     }
@@ -2496,7 +2558,11 @@ impl TryFrom<&PyRepositoryConfig> for RepositoryConfig {
                 caching: value.caching.as_ref().map(|c| (&*c.borrow(py)).into()),
                 storage: value.storage.as_ref().map(|s| (&*s.borrow(py)).into()),
                 virtual_chunk_containers: cont,
-                manifest: value.manifest.as_ref().map(|c| (&*c.borrow(py)).into()),
+                manifest: value
+                    .manifest
+                    .as_ref()
+                    .map(|c| ManifestConfig::try_from(&*c.borrow(py)))
+                    .transpose()?,
                 previous_file: value.previous_file.clone(),
                 repo_update_retries: value
                     .repo_update_retries
@@ -2759,7 +2825,10 @@ impl PyRepositoryConfig {
     pub fn merge(&self, other: &PyRepositoryConfig) -> PyResult<PyRepositoryConfig> {
         let this: RepositoryConfig = self.try_into().map_err(PyValueError::new_err)?;
         let other: RepositoryConfig = other.try_into().map_err(PyValueError::new_err)?;
-        Ok(this.merge(other).into())
+        Ok(this
+            .merge(other)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?
+            .into())
     }
 
     pub fn __repr__(&self) -> String {
